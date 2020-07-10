@@ -6,9 +6,9 @@ open System.Net
 open DotNetLightning.Serialize
 
 open GWallet.Backend
+open FSharpUtil
 
 open Newtonsoft.Json
-
 
 module JsonMarshalling =
 
@@ -17,10 +17,7 @@ module JsonMarshalling =
 
         override __.ReadJson(reader: JsonReader, _: Type, _: FeatureBit, _: bool, serializer: JsonSerializer): FeatureBit =
             let serializedFeatureBit = serializer.Deserialize<string> reader
-            let parsed = FeatureBit.TryParse serializedFeatureBit
-            match parsed with
-            | Ok featureBit -> featureBit
-            | _ -> failwith "error decoding feature bit"
+            UnwrapResult (FeatureBit.TryParse serializedFeatureBit) "error decoding feature bit"
 
         override __.WriteJson(writer: JsonWriter, state: FeatureBit, serializer: JsonSerializer) =
             serializer.Serialize(writer, state.ToString())

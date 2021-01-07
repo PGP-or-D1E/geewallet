@@ -166,6 +166,22 @@ type EstimateSmartFeeResponse = {
     blocks: uint64
 }
 
+type UnspentResponse = {
+    txid: string
+    vout: uint32
+    amount: decimal
+}
+
+type SignRawTransactionWithWalletError = {
+    error: string
+}
+
+type SignRawTransactionWithWalletResponse = {
+    hex: string
+    complete: bool
+    errors: list<SignRawTransactionWithWalletError>
+}
+
 type Bitcoind = {
     WorkDir: string
     DataDir: string
@@ -187,6 +203,8 @@ type Bitcoind = {
         let rpcUser = Path.GetRandomFileName()
         let rpcPassword = Path.GetRandomFileName()
         let confPath = Path.Combine(dataDir, "bitcoin.conf")
+        let defaultFeeRate = FeeRatePerKw 5000u
+        (*
         let fakeFeeRate = !UtxoCoin.ElectrumClient.RegTestFakeFeeRate
         File.WriteAllText(
             confPath,
@@ -207,24 +225,292 @@ type Bitcoind = {
                 rpcPassword
                 fakeFeeRate
         )
+        *)
+        File.WriteAllText(
+            confPath,
+            SPrintF2
+                "\
+                txindex=1\n\
+                printtoconsole=1\n\
+                rpcuser=%s\n\
+                rpcpassword=%s\n\
+                rpcallowip=127.0.0.1\n\
+                zmqpubrawblock=tcp://127.0.0.1:28332\n\
+                zmqpubrawtx=tcp://127.0.0.1:28333\n\
+                [regtest]\n\
+                rpcbind=127.0.0.1\n\
+                rpcport=18554"
+                rpcUser
+                rpcPassword
+        )
 
         let processWrapper =
             ProcessWrapper.New
                 "bitcoind"
                 workDir
-                (SPrintF1 "-regtest -datadir=%s" dataDir)
+                (SPrintF1 "-regtest -datadir=%s -acceptnonstdtxn" dataDir)
                 Map.empty
                 false
         processWrapper.WaitForMessage (fun msg -> msg.EndsWith "init message: Done loading")
-        {
+        let ret = {
             WorkDir = workDir
             DataDir = dataDir
             RpcUser = rpcUser
             RpcPassword = rpcPassword
             ProcessWrapper = processWrapper
         }
+        let selfAddress = ret.GetNewAddress()
+        ret.GenerateBlocksRaw
+            (BlockHeightOffset32 (10u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
+            selfAddress
+        ret.SetFeeRateByMining defaultFeeRate
+        ret
 
-    member this.GenerateBlocks (number: BlockHeightOffset32) (address: BitcoinAddress) =
+    member this.GetBlockHeight (): BlockHeight =
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF1 "-regtest -datadir=%s getblockcount" this.DataDir)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = String.concat "\n" lines
+        Console.WriteLine(sprintf "getblockcount gave us: %s" output)
+        let height = JsonConvert.DeserializeObject<uint32> output
+        BlockHeight height
+
+    member this.GetBlockHash (blockHeight: BlockHeight): uint256 =
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF2 "-regtest -datadir=%s getblockhash %i" this.DataDir blockHeight.Value)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = String.concat "\n" lines
+        uint256 output
+
+    member this.GetBlock (blockHash: uint256): Block =
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF2 "-regtest -datadir=%s getblock %s 2" this.DataDir (blockHash.ToString()))
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = String.concat "\n" lines
+        Console.WriteLine(sprintf "getblock gave us: %s" output)
+        Block.Parse(output, Network.RegTest)
+
+    member this.SetFeeRateForBitcoindTransactions (feeRate: FeeRatePerKw): unit =
+        let feeRateDecimal =
+            let satPerKw = decimal feeRate.Value
+            let kwPerKB = 4m
+            let satPerKB = satPerKw * kwPerKB
+            let btcPerKB = (Money (satPerKB, MoneyUnit.Satoshi)).ToUnit MoneyUnit.BTC
+            btcPerKB
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF2 "-regtest -datadir=%s settxfee %M" this.DataDir feeRateDecimal)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = String.concat "\n" lines
+        let success = JsonConvert.DeserializeObject<bool> output
+        assert success
+
+    member this.SetFeeRateByMining (feeRate: FeeRatePerKw): unit =
+        let address = this.GetNewAddress()
+        this.SetFeeRateForBitcoindTransactions feeRate
+        let rec setFeeRate () =
+            let currentFeeRate = this.EstimateSmartFee (BlockHeightOffset16 6us)
+            Console.WriteLine(sprintf "FEERATE: target == %A, current == %A" feeRate currentFeeRate)
+            match currentFeeRate with
+            | Some currentFeeRate when currentFeeRate >= feeRate -> ()
+            | _ ->
+                this.GenerateBlocksWithFeeRate (BlockHeightOffset32 1u) address feeRate
+                setFeeRate()
+        setFeeRate()
+
+    member this.SignRawTransactionWithWallet (transaction: Transaction): Transaction =
+        Console.WriteLine(sprintf "in SignRawTransactionWithWallet")
+        Console.WriteLine(sprintf "transaction == %A" transaction)
+        let transactionHex = transaction.ToHex()
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF2 "-regtest -datadir=%s signrawtransactionwithwallet %s" this.DataDir transactionHex)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = String.concat "\n" lines
+        Console.WriteLine(sprintf "output == %s" output)
+        let response = JsonConvert.DeserializeObject<SignRawTransactionWithWalletResponse> output
+        Console.WriteLine(sprintf "response == %A" response)
+        if response.complete && (Object.ReferenceEquals(response.errors, null) || response.errors.Length = 0) then
+            Transaction.Parse(response.hex, Network.RegTest)
+        else
+            failwith "signrawtransactionwithwallet failed"
+
+    member this.TrySendRawTransaction (transaction: Transaction): Option<TxId> =
+        let transactionHex = transaction.ToHex()
+        Console.WriteLine(sprintf "sending raw transaction: %s" transactionHex)
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF2 "-regtest -datadir=%s sendrawtransaction %s 0" this.DataDir transactionHex)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = (String.concat "\n" lines).Trim()
+        Console.WriteLine(sprintf "sendrawtransaction gave us: %s" output)
+        if output.StartsWith "error code" then
+            None
+        else
+            output |> uint256 |> TxId |> Some
+
+    member this.ListUnspent (): list<Coin> =
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF1 "-regtest -datadir=%s listunspent" this.DataDir)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = String.concat "\n" lines
+        let unspentList = JsonConvert.DeserializeObject<list<UnspentResponse>> output
+        Console.WriteLine(sprintf "UNSPENT = %A" unspentList)
+        List.map
+            (fun (unspent: UnspentResponse) ->
+                Coin(
+                    uint256 unspent.txid,
+                    unspent.vout,
+                    Money(unspent.amount, MoneyUnit.BTC),
+                    Script.Empty
+                )
+            )
+            unspentList
+
+    //member this.TrySendFatTx (amount: Money) (size: uint32) (feeRate: FeeRatePerKw): Option<TxId> =
+    member this.TrySendFatTx (unspentCoins: list<Coin>) (amount: Money) (size: uint32) (feeRate: FeeRatePerKw): Option<list<Coin>> =
+        let feeOverEstimate = feeRate.CalculateFeeFromVirtualSize ((uint64 size) * 2UL)
+        let amountWithFee = amount + feeOverEstimate
+        //let unspentCoins = this.ListUnspent()
+        let rec collectCoins (total: Money) (acc: list<Coin>) (consume: list<Coin>): Money * list<Coin> * list<Coin> =
+            if total > amountWithFee then
+                total, acc, consume
+            else
+                match List.tryHead consume with
+                | Some coin ->
+                    collectCoins (total + coin.Amount) (coin :: acc) (List.tail consume)
+                | None -> failwith "not enough funds to send fat tx"
+        let total, coins, remainingUnspent = collectCoins Money.Zero List.empty unspentCoins
+
+        let transaction = Network.RegTest.CreateTransaction()
+        for coin in coins do
+            let txIn = TxIn coin.Outpoint
+            transaction.Inputs.Add txIn |> ignore
+        let txOut =
+            let scriptPubKey =
+                seq {
+                    for _ in 0u .. size do
+                        yield Op.op_Implicit OpcodeType.OP_NOP
+                    yield Op.GetPushOp 0L
+                }
+                |> List.ofSeq
+                |> Script
+            TxOut(amount, scriptPubKey)
+        transaction.Outputs.Add txOut |> ignore
+        let changeAmount = total - amountWithFee
+        let changeTxOut =
+            let changeAddress = this.GetNewAddress()
+            TxOut(changeAmount, changeAddress)
+        transaction.Outputs.Add changeTxOut |> ignore
+
+        (*
+        let transactionBuilder = Network.RegTest.CreateTransactionBuilder()
+        transactionBuilder.DustPrevention <- false
+        let changeAddress = this.GetNewAddress()
+        transactionBuilder.SetChange changeAddress |> ignore
+        for coin in coins do
+            transactionBuilder.AddCoins coin |> ignore
+        let scriptPubKey =
+            seq {
+                for _ in 0u .. size do
+                    yield Op.op_Implicit OpcodeType.OP_NOP
+                yield Op.GetPushOp 0L
+            }
+            |> List.ofSeq
+            |> Script
+        transactionBuilder.Send(scriptPubKey, amount) |> ignore
+        let transaction = transactionBuilder.BuildTransaction false
+        *)
+        let signedTransaction = this.SignRawTransactionWithWallet transaction
+        Console.WriteLine(sprintf "sending fat tx of size %i" size)
+        //this.TrySendRawTransaction signedTransaction
+        let txIdOpt = this.TrySendRawTransaction signedTransaction
+        match txIdOpt with
+        | None -> None
+        | Some txId ->
+            let newCoin = Coin(txId.Value, 1u, changeAmount, Script.Empty)
+            Some (newCoin :: remainingUnspent)
+        
+    member this.FillCurrentBlock (feeRate: FeeRatePerKw): unit = 
+        let burnAddress =
+            let key = new Key()
+            let pubKey = key.PubKey
+            pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
+        let rec fillBlockWithBurnTxs (txCount: int) =
+            let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
+            let newTxCount = this.GetTxIdsInMempool().Length
+            if newTxCount > txCount then
+                fillBlockWithBurnTxs newTxCount
+
+        let rec fillBlockWithFatTxs (unspentCoins: list<Coin>) (txCount: int) (size: uint32) =
+            //let txIdOpt = this.TrySendFatTx (Money(0.0001m, MoneyUnit.BTC)) size feeRate
+            let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) size feeRate
+            match newUnspentCoinsOpt with
+            | Some newUnspentCoins ->
+                let newTxCount = this.GetTxIdsInMempool().Length
+                if newTxCount > txCount then
+                    fillBlockWithFatTxs newUnspentCoins newTxCount size
+                else
+                    if size <> 0u then
+                        fillBlockWithFatTxs unspentCoins txCount (size / 2u)
+            | None -> ()
+
+        let unspentCoins = this.ListUnspent()
+        let initialTxCount = this.GetTxIdsInMempool().Length
+        //fillBlockWithFatTxs initialTxCount 1000000u
+        fillBlockWithFatTxs unspentCoins initialTxCount 10000u
+        //let newTxCount = this.GetTxIdsInMempool().Length
+        //fillBlockWithBurnTxs newTxCount
+        //let finalTxCount = this.GetTxIdsInMempool().Length
+        //failwithf "initialTxCount == %i; newTxCount == %i; finalTxCount == %i" initialTxCount newTxCount finalTxCount
+
+        (*
+        let burnAddress =
+            let key = new Key()
+            let pubKey = key.PubKey
+            pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
+        let rec fillBlock (txCount: int) =
+            let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
+            let newTxCount = this.GetTxIdsInMempool().Length
+            if newTxCount > txCount then
+                fillBlock newTxCount
+        let initialTxCount = this.GetTxIdsInMempool().Length
+        fillBlock initialTxCount
+        *)
+
+    member this.GenerateBlocksRaw (number: BlockHeightOffset32) (address: BitcoinAddress) =
         use bitcoinCli =
             ProcessWrapper.New
                 "bitcoin-cli"
@@ -233,6 +519,30 @@ type Bitcoind = {
                 Map.empty
                 false
         bitcoinCli.WaitForExit()
+
+    member this.GenerateBlocksWithFeeRate (number: BlockHeightOffset32) (address: BitcoinAddress) (feeRate: FeeRatePerKw) =
+        Console.WriteLine(sprintf "WOWZERS - generating %i blocks" number.Value)
+        let rec generateFullBlocks (blockNumber: uint32) =
+            let balance = this.GetBalance()
+            Console.WriteLine(sprintf "WOWZERS - generating block %i, balance %A" blockNumber balance)
+            if blockNumber < number.Value then
+                this.FillCurrentBlock feeRate
+                this.GenerateBlocksRaw (BlockHeightOffset32 1u) address
+                let blockHeight = this.GetBlockHeight()
+                let blockHash = this.GetBlockHash blockHeight
+                let block = this.GetBlock blockHash
+                Console.WriteLine(sprintf "BLOCK: %A" block)
+                generateFullBlocks (blockNumber + 1u)
+        generateFullBlocks 0u
+
+    member this.GenerateBlocks (number: BlockHeightOffset32) (address: BitcoinAddress) =
+        let feeRateOpt = this.EstimateSmartFee (BlockHeightOffset16 1us)
+        let feeRate = UnwrapOption feeRateOpt "GenerateBlocks called before fee rate has been set"
+        this.GenerateBlocksWithFeeRate number address feeRate
+
+    member this.GenerateBlocksToSelf (number: BlockHeightOffset32) =
+        let address = this.GetNewAddress()
+        this.GenerateBlocks number address
 
     member this.GetTxIdsInMempool(): list<TxId> =
         use bitcoinCli =
@@ -295,6 +605,20 @@ type Bitcoind = {
         let address = (String.concat "\n" lines).Trim()
         BitcoinAddress.Create(address, Network.RegTest)
 
+    (*
+    member this.GetRawChangeAddress(): BitcoinAddress =
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF1 "-regtest -datadir=%s getrawchangeaddress" this.DataDir)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let address = (String.concat "\n" lines).Trim()
+        BitcoinAddress.Create(address, Network.RegTest)
+    *)
+
     member this.FundByMining (amount: Money): unit =
         let address = this.GetNewAddress()
         let rec fund() =
@@ -321,50 +645,6 @@ type Bitcoind = {
             | _ ->
                 failwithf "got this from sendtoaddress == %s" txIdString
         TxId <| wowzers
-
-    member this.Burn (amount: Money): TxId =
-        let address =
-            let key = new Key()
-            let pubKey = key.PubKey
-            pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
-        this.SendToAddress address amount
-
-    member this.SetFeeRate (feeRate: FeeRatePerKw): unit =
-        let feeRateDecimal =
-            let satPerKw = decimal feeRate.Value
-            let kwPerKB = 4m
-            let satPerKB = satPerKw * kwPerKB
-            let btcPerKB = (Money (satPerKB, MoneyUnit.Satoshi)).ToUnit MoneyUnit.BTC
-            btcPerKB
-        use bitcoinCli =
-            ProcessWrapper.New
-                "bitcoin-cli"
-                this.WorkDir
-                (SPrintF2 "-regtest -datadir=%s settxfee %M" this.DataDir feeRateDecimal)
-                Map.empty
-                false
-        let lines = bitcoinCli.ReadToEnd()
-        let output = String.concat "\n" lines
-        let success = JsonConvert.DeserializeObject<bool> output
-        assert success
-
-        let sinkAddress = this.GetNewAddress()
-        let rec fillBlocksUntilFeeRateSet() =
-            let rec fillBlock (txCount: int) =
-                let _txId = this.Burn(Money(0.0001m, MoneyUnit.BTC))
-                let newTxCount = this.GetTxIdsInMempool().Length
-                if newTxCount > txCount then
-                    fillBlock newTxCount
-            this.GenerateBlocks (BlockHeightOffset32 (uint32 1)) sinkAddress
-            fillBlock 0
-
-            let reportedFeeRateOpt = this.EstimateSmartFee (BlockHeightOffset16 (uint16 1))
-            match reportedFeeRateOpt with
-            | Some reportedFeeRate when reportedFeeRate >= feeRate -> ()
-            | _ ->
-                fillBlocksUntilFeeRateSet()
-        fillBlocksUntilFeeRateSet()
-        this.GenerateBlocks (BlockHeightOffset32 (uint32 1)) sinkAddress
 
     member this.RpcUrl: string =
         SPrintF2 "http://%s:%s@127.0.0.1:18554" this.RpcUser this.RpcPassword
@@ -420,12 +700,14 @@ type ElectrumServer = {
         return feeRatePerKw
     }
 
+    (*
     static member SetEstimatedFeeRate(feeRatePerKw: FeeRatePerKw) =
         let satPerKw = decimal feeRatePerKw.Value
         let kwPerKB = 4m
         let satPerKB = satPerKw * kwPerKB
         let btcPerKB = (Money (satPerKB, MoneyUnit.Satoshi)).ToUnit MoneyUnit.BTC
         ElectrumClient.SetRegTestFakeFeeRate btcPerKB
+    *)
 
 type Lnd = {
     LndDir: string
@@ -723,22 +1005,29 @@ type LN() =
 
     [<Category("GeewalletToGeewalletFunder")>]
     [<Test>]
-    [<Timeout(200000)>]
+    [<Timeout(1800000)>]
     member __.``can send/receive monohop payments and close channel (funder)``() = Async.RunSynchronously <| async {
         use! walletInstance = WalletInstance.New None None
         use bitcoind = Bitcoind.Start()
         use _electrumServer = ElectrumServer.Start bitcoind
-        use! lnd = Lnd.Start bitcoind
+        //use! lnd = Lnd.Start bitcoind
+        let feeRate = FeeRatePerKw 5000u
 
+        Console.WriteLine(sprintf "FUNDER - QQQ")
+
+
+        (*
         // As explained in the other test, geewallet cannot use coinbase outputs.
         // To work around that we mine a block to a LND instance and afterwards tell
         // it to send funds to the funder geewallet instance
         let! address = lnd.GetDepositAddress()
         let blocksMinedToLnd = BlockHeightOffset32 1u
         bitcoind.GenerateBlocks blocksMinedToLnd address
+        Console.WriteLine(sprintf "FUNDER - EEE")
 
         let maturityDurationInNumberOfBlocks = BlockHeightOffset32 (uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity)
-        bitcoind.GenerateBlocks maturityDurationInNumberOfBlocks walletInstance.Address
+        bitcoind.GenerateBlocksToSelf maturityDurationInNumberOfBlocks
+        Console.WriteLine(sprintf "FUNDER - RRR")
 
         // We confirm the one block mined to LND, by waiting for LND to see the chain
         // at a height which has that block matured. The height at which the block will
@@ -749,15 +1038,22 @@ type LN() =
         // the coinbase maturity may be defined differently in other coins.
         do! lnd.WaitForBlockHeight (BlockHeight.Zero + blocksMinedToLnd + maturityDurationInNumberOfBlocks)
         do! lnd.WaitForBalance (Money(50UL, MoneyUnit.BTC))
+        Console.WriteLine(sprintf "FUNDER - TTT")
+        *)
 
         // fund geewallet
         let geewalletAccountAmount = Money (25m, MoneyUnit.BTC)
-        let! feeRate = ElectrumServer.EstimateFeeRate()
-        let! _txid = lnd.SendCoins geewalletAccountAmount walletInstance.Address feeRate
+        let _txId = bitcoind.SendToAddress walletInstance.Address geewalletAccountAmount
+        //let! feeRate = ElectrumServer.EstimateFeeRate()
+        //let! _txid = lnd.SendCoins geewalletAccountAmount walletInstance.Address feeRate
+        Console.WriteLine(sprintf "FUNDER - YYY")
 
+        (*
         // wait for lnd's transaction to appear in mempool
         while bitcoind.GetTxIdsInMempool().Length = 0 do
             Thread.Sleep 500
+        Console.WriteLine(sprintf "FUNDER - UUU")
+        *)
 
         // We want to make sure Geewallet consideres the money received.
         // A typical number of blocks that is almost universally considered
@@ -770,14 +1066,19 @@ type LN() =
         // At that point, the 0.25 regtest coins from the above call to sendcoins
         // are considered arrived to Geewallet.
         let consideredConfirmedAmountOfBlocksPlusOne = BlockHeightOffset32 7u
-        bitcoind.GenerateBlocks consideredConfirmedAmountOfBlocksPlusOne walletInstance.Address
+        bitcoind.GenerateBlocksToSelf consideredConfirmedAmountOfBlocksPlusOne
+        Console.WriteLine(sprintf "FUNDER - III")
 
         let fundingAmount = Money(0.1m, MoneyUnit.BTC)
         let! transferAmount = async {
             let! accountBalance = walletInstance.WaitForBalance fundingAmount
             return TransferAmount (fundingAmount.ToDecimal MoneyUnit.BTC, accountBalance.ToDecimal MoneyUnit.BTC, Currency.BTC)
         }
+        Console.WriteLine(sprintf "FUNDER - OOO")
+        let wowzers = bitcoind.EstimateSmartFee (BlockHeightOffset16 1us)
+        Console.WriteLine(sprintf "FUNDER - fee is currently %A" wowzers)
         let! metadata = ChannelManager.EstimateChannelOpeningFee (walletInstance.Account :?> NormalUtxoAccount) transferAmount
+        Console.WriteLine(sprintf "FUNDER - PPP")
         let! pendingChannelRes =
             Lightning.Network.OpenChannel
                 walletInstance.Node
@@ -785,12 +1086,16 @@ type LN() =
                 transferAmount
                 metadata
                 walletInstance.Password
+        Console.WriteLine(sprintf "FUNDER - AAA")
         let pendingChannel = UnwrapResult pendingChannelRes "OpenChannel failed"
         let minimumDepth = (pendingChannel :> IChannelToBeOpened).ConfirmationsRequired
         let channelId = (pendingChannel :> IChannelToBeOpened).ChannelId
         let! fundingTxIdRes = pendingChannel.Accept()
+        Console.WriteLine(sprintf "FUNDER - SSS")
         let _fundingTxId = UnwrapResult fundingTxIdRes "pendingChannel.Accept failed"
-        bitcoind.GenerateBlocks (BlockHeightOffset32 minimumDepth) walletInstance.Address
+        Console.WriteLine(sprintf "FUNDER - DDD")
+        bitcoind.GenerateBlocksToSelf (BlockHeightOffset32 minimumDepth)
+        Console.WriteLine(sprintf "FUNDER - FFF")
 
         do!
             let channelInfo = walletInstance.ChannelStore.ChannelInfo channelId
@@ -813,6 +1118,7 @@ type LN() =
                     return ()
             }
             waitForFundingConfirmed()
+        Console.WriteLine(sprintf "FUNDER - GGG")
 
         let! lockFundingRes = Lightning.Network.LockChannelFunding walletInstance.Node channelId
         UnwrapResult lockFundingRes "LockChannelFunding failed"
@@ -861,12 +1167,18 @@ type LN() =
         if Money(channelInfoAfterPayment1.Balance, MoneyUnit.BTC) <> fundingAmount - WalletToWalletTestPayment0Amount - WalletToWalletTestPayment1Amount then
             failwith "incorrect balance after payment 1"
 
-        ElectrumServer.SetEstimatedFeeRate (feeRate * 4u)
+        //do! lnd.FloodTransactionsToSetFeeRate bitcoind feeRate
+
+        //ElectrumServer.SetEstimatedFeeRate (FeeRatePerKw (feeRate.Value * 4u))
+        bitcoind.SetFeeRateByMining (feeRate * 4u)
         let! newFeeRateOpt = walletInstance.ChannelStore.FeeUpdateRequired channelId
         let newFeeRate = UnwrapOption newFeeRateOpt "Fee update should be required"
+        Console.WriteLine(sprintf "new fee is %A" newFeeRate)
         let! updateFeeRes =
             Lightning.Network.UpdateFee walletInstance.Node channelId newFeeRate
         UnwrapResult updateFeeRes "UpdateFee failed"
+
+        //ElectrumServer.SetEstimatedFeeRate (FeeRatePerKw (uint32 0))
 
         let! closeChannelRes = Lightning.Network.CloseChannel walletInstance.Node channelId
         match closeChannelRes with
@@ -878,7 +1190,7 @@ type LN() =
         | status -> failwith (SPrintF1 "unexpected channel status. Expected Closing, got %A" status)
 
         // Mine 10 blocks to make sure closing tx is confirmed
-        bitcoind.GenerateBlocks (BlockHeightOffset32 (uint32 10)) walletInstance.Address
+        bitcoind.GenerateBlocksToSelf (BlockHeightOffset32 (uint32 10))
         
         let rec waitForClosingTxConfirmed attempt = async {
             Infrastructure.LogDebug (SPrintF1 "Checking if closing tx is finished, attempt #%d" attempt)
@@ -904,17 +1216,21 @@ type LN() =
 
     [<Category("GeewalletToGeewalletFundee")>]
     [<Test>]
-    [<Timeout(200000)>]
+    [<Timeout(1800000)>]
     member __.``can send/receive monohop payments and close channel (fundee)``() = Async.RunSynchronously <| async {
+        Console.WriteLine(sprintf "FUNDEE - QQQ")
         use! walletInstance = WalletInstance.New (Some FundeeLightningIPEndpoint) (Some FundeeAccountsPrivateKey)
-        let! feeRate = ElectrumServer.EstimateFeeRate()
+        Console.WriteLine(sprintf "FUNDEE - WWW")
+        //let! feeRate = ElectrumServer.EstimateFeeRate()
         let! pendingChannelRes =
             Lightning.Network.AcceptChannel
                 walletInstance.Node
+        Console.WriteLine(sprintf "FUNDEE - EEE")
 
         let (channelId, _) = UnwrapResult pendingChannelRes "OpenChannel failed"
 
         let! lockFundingRes = Lightning.Network.LockChannelFunding walletInstance.Node channelId
+        Console.WriteLine(sprintf "FUNDEE - RRR")
         UnwrapResult lockFundingRes "LockChannelFunding failed"
 
         let channelInfo = walletInstance.ChannelStore.ChannelInfo channelId
@@ -922,11 +1238,15 @@ type LN() =
         | ChannelStatus.Active -> ()
         | status -> failwith (SPrintF1 "unexpected channel status. Expected Active, got %A" status)
 
+        let! feeRate = ElectrumServer.EstimateFeeRate()
+
         if Money(channelInfo.Balance, MoneyUnit.BTC) <> Money(0.0m, MoneyUnit.BTC) then
             failwith "incorrect balance after accepting channel"
 
+        Console.WriteLine(sprintf "FUNDEE - TTT")
         let! receiveMonoHopPaymentRes =
             Lightning.Network.ReceiveMonoHopPayment walletInstance.Node channelId
+        Console.WriteLine(sprintf "FUNDEE - YYY")
         UnwrapResult receiveMonoHopPaymentRes "ReceiveMonoHopPayment failed"
 
         let channelInfoAfterPayment0 = walletInstance.ChannelStore.ChannelInfo channelId
@@ -949,7 +1269,18 @@ type LN() =
         if Money(channelInfoAfterPayment1.Balance, MoneyUnit.BTC) <> WalletToWalletTestPayment0Amount + WalletToWalletTestPayment1Amount then
             failwith "incorrect balance after receiving payment 1"
 
-        ElectrumServer.SetEstimatedFeeRate (feeRate * 4u)
+        let newFeeRate = feeRate * 4u
+        let rec waitForFeeAdjustment() = async {
+            let! currentFeeRate = ElectrumServer.EstimateFeeRate()
+            if currentFeeRate < newFeeRate then
+                do! Async.Sleep 2000
+                return! waitForFeeAdjustment()
+            return ()
+        }
+        do! waitForFeeAdjustment()
+
+        //ElectrumServer.SetEstimatedFeeRate (FeeRatePerKw (feeRate.Value * 4u))
+        //bitcoind.SetFeeRate (feeRate * 4u)
         let! acceptUpdateFeeRes =
             Lightning.Network.AcceptUpdateFee walletInstance.Node channelId
         UnwrapResult acceptUpdateFeeRes "AcceptUpdateFee failed"
@@ -962,6 +1293,7 @@ type LN() =
         return ()
     }
 
+    (*
     [<Category("GeewalletToLndFunder")>]
     [<Test>]
     [<Timeout(500000)>]
@@ -973,7 +1305,7 @@ type LN() =
 
         let! address = lnd.GetDepositAddress()
         let blocksMinedToLnd = BlockHeightOffset32 1u
-        bitcoind.GenerateBlocks blocksMinedToLnd address
+        bitcoind.GenerateBlocksRaw blocksMinedToLnd address
 
         // Geewallet cannot use these outputs, even though they are encumbered with an output
         // script from its wallet. This is because they come from coinbase. Coinbase outputs are
@@ -982,7 +1314,7 @@ type LN() =
         // do not use Geewallet. If the coins were to be detected by geewallet,
         // this test would still work. This comment is just here to avoid confusion.
         let maturityDurationInNumberOfBlocks = BlockHeightOffset32 (uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity)
-        bitcoind.GenerateBlocks maturityDurationInNumberOfBlocks walletInstance.Address
+        bitcoind.GenerateBlocksRaw maturityDurationInNumberOfBlocks walletInstance.Address
 
         // We confirm the one block mined to LND, by waiting for LND to see the chain
         // at a height which has that block matured. The height at which the block will
@@ -1014,7 +1346,7 @@ type LN() =
         // At that point, the 0.25 regtest coins from the above call to sendcoins
         // are considered arrived to Geewallet.
         let consideredConfirmedAmountOfBlocksPlusOne = BlockHeightOffset32 7u
-        bitcoind.GenerateBlocks consideredConfirmedAmountOfBlocksPlusOne walletInstance.Address
+        bitcoind.GenerateBlocksRaw consideredConfirmedAmountOfBlocksPlusOne walletInstance.Address
 
         let! lndEndPoint = lnd.GetEndPoint()
         let! transferAmount = async {
@@ -1035,7 +1367,7 @@ type LN() =
         let channelId = (pendingChannel :> IChannelToBeOpened).ChannelId
         let! fundingTxIdRes = pendingChannel.Accept()
         let _fundingTxId = UnwrapResult fundingTxIdRes "pendingChannel.Accept failed"
-        bitcoind.GenerateBlocks (BlockHeightOffset32 minimumDepth) walletInstance.Address
+        bitcoind.GenerateBlocksRaw (BlockHeightOffset32 minimumDepth) walletInstance.Address
 
         do! walletInstance.WaitForFundingConfirmed channelId
 
@@ -1057,7 +1389,7 @@ type LN() =
         | status -> failwith (SPrintF1 "unexpected channel status. Expected Closing, got %A" status)
 
         // Mine 10 blocks to make sure closing tx is confirmed
-        bitcoind.GenerateBlocks (BlockHeightOffset32 (uint32 10)) walletInstance.Address
+        bitcoind.GenerateBlocksRaw (BlockHeightOffset32 (uint32 10)) walletInstance.Address
         
         let rec waitForClosingTxConfirmed attempt = async {
             Infrastructure.LogDebug (SPrintF1 "Checking if closing tx is finished, attempt #%d" attempt)
@@ -1092,7 +1424,7 @@ type LN() =
 
         let! address = lnd.GetDepositAddress()
         let blocksMinedToLnd = BlockHeightOffset32 1u
-        bitcoind.GenerateBlocks blocksMinedToLnd address
+        bitcoind.GenerateBlocksRaw blocksMinedToLnd address
 
         // Geewallet cannot use these outputs, even though they are encumbered with an output
         // script from its wallet. This is because they come from coinbase. Coinbase outputs are
@@ -1101,7 +1433,7 @@ type LN() =
         // do not use Geewallet. If the coins were to be detected by geewallet,
         // this test would still work. This comment is just here to avoid confusion.
         let maturityDurationInNumberOfBlocks = BlockHeightOffset32 (uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity)
-        bitcoind.GenerateBlocks maturityDurationInNumberOfBlocks walletInstance.Address
+        bitcoind.GenerateBlocksRaw maturityDurationInNumberOfBlocks walletInstance.Address
 
         // We confirm the one block mined to LND, by waiting for LND to see the chain
         // at a height which has that block matured. The height at which the block will
@@ -1137,7 +1469,7 @@ type LN() =
 
         // Mine blocks on top of the funding transaction to make it confirmed.
         let minimumDepth = BlockHeightOffset32 6u
-        bitcoind.GenerateBlocks minimumDepth walletInstance.Address
+        bitcoind.GenerateBlocksRaw minimumDepth walletInstance.Address
 
         do! walletInstance.WaitForFundingConfirmed channelId
 
@@ -1185,7 +1517,7 @@ type LN() =
 
             // Mine blocks on top of the closing transaction to make it confirmed.
             let minimumDepth = BlockHeightOffset32 6u
-            bitcoind.GenerateBlocks minimumDepth walletInstance.Address
+            bitcoind.GenerateBlocksRaw minimumDepth walletInstance.Address
             return ()
         }
 
@@ -1208,10 +1540,10 @@ type LN() =
         // it to send funds to the funder geewallet instance
         let! lndAddress = lnd.GetDepositAddress()
         let blocksMinedToLnd = BlockHeightOffset32 1u
-        bitcoind.GenerateBlocks blocksMinedToLnd lndAddress
+        bitcoind.GenerateBlocksRaw blocksMinedToLnd lndAddress
 
         let maturityDurationInNumberOfBlocks = BlockHeightOffset32 (uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity)
-        bitcoind.GenerateBlocks maturityDurationInNumberOfBlocks lndAddress
+        bitcoind.GenerateBlocksRaw maturityDurationInNumberOfBlocks lndAddress
 
         // We confirm the one block mined to LND, by waiting for LND to see the chain
         // at a height which has that block matured. The height at which the block will
@@ -1243,7 +1575,7 @@ type LN() =
         // At that point, the 0.25 regtest coins from the above call to sendcoins
         // are considered arrived to Geewallet.
         let consideredConfirmedAmountOfBlocksPlusOne = BlockHeightOffset32 7u
-        bitcoind.GenerateBlocks consideredConfirmedAmountOfBlocksPlusOne lndAddress
+        bitcoind.GenerateBlocksRaw consideredConfirmedAmountOfBlocksPlusOne lndAddress
 
         let fundingAmount = Money(0.1m, MoneyUnit.BTC)
         let! transferAmount = async {
@@ -1263,7 +1595,7 @@ type LN() =
         let channelId = (pendingChannel :> IChannelToBeOpened).ChannelId
         let! fundingTxIdRes = pendingChannel.Accept()
         let _fundingTxId = UnwrapResult fundingTxIdRes "pendingChannel.Accept failed"
-        bitcoind.GenerateBlocks (BlockHeightOffset32 minimumDepth) lndAddress
+        bitcoind.GenerateBlocksRaw (BlockHeightOffset32 minimumDepth) lndAddress
 
         do!
             let channelInfo = walletInstance.ChannelStore.ChannelInfo channelId
@@ -1343,7 +1675,7 @@ type LN() =
             do! Async.Sleep 500
         
         // mine the theft tx into a block
-        bitcoind.GenerateBlocks (BlockHeightOffset32 1u) lndAddress
+        bitcoind.GenerateBlocksRaw (BlockHeightOffset32 1u) lndAddress
 
         let! accountBalanceBeforeSpendingTheftTx =
             walletInstance.GetBalance()
@@ -1372,7 +1704,7 @@ type LN() =
         do! Async.Sleep 10000
 
         // mine enough blocks to confirm whichever tx spends the theft tx
-        bitcoind.GenerateBlocks (BlockHeightOffset32 minimumDepth) lndAddress
+        bitcoind.GenerateBlocksRaw (BlockHeightOffset32 minimumDepth) lndAddress
 
         let! accountBalanceAfterSpendingTheftTx =
             walletInstance.GetBalance()
@@ -1453,4 +1785,5 @@ type LN() =
 
         return ()
     }
+    *)
 

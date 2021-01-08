@@ -172,6 +172,24 @@ type UnspentResponse = {
     amount: decimal
 }
 
+type MempoolInfo = {
+    TransactionCount: uint32
+    TotalWeight: uint32
+    MemoryUsage: uint64
+    MaxMemoryUsage: uint64
+    MinFee: FeeRatePerKw
+    MinRelayFee: FeeRatePerKw
+}
+
+type GetMempoolInfoResponse = {
+    size: uint32
+    bytes: decimal
+    usage: uint64
+    maxmempool: uint64
+    mempoolminfee: decimal
+    minrelaytxfee: decimal
+}
+
 type SignRawTransactionWithWalletError = {
     error: string
 }
@@ -261,10 +279,45 @@ type Bitcoind = {
         }
         let selfAddress = ret.GetNewAddress()
         ret.GenerateBlocksRaw
-            (BlockHeightOffset32 (10u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
+            // TODO: split coins instead of making this 20
+            (BlockHeightOffset32 (20u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
             selfAddress
         ret.SetFeeRateByMining defaultFeeRate
         ret
+
+    member this.GetMempoolInfo (): MempoolInfo =
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF1 "-regtest -datadir=%s getmempoolinfo" this.DataDir)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let output = String.concat "\n" lines
+        let response = JsonConvert.DeserializeObject<GetMempoolInfoResponse> output
+        {
+            TransactionCount = response.size
+            TotalWeight = uint32 (4m * response.bytes)
+            MemoryUsage = response.usage
+            MaxMemoryUsage = response.maxmempool
+            MinFee =
+                let btcPerKB = response.mempoolminfee
+                let satPerKB = (Money (btcPerKB, MoneyUnit.BTC)).ToUnit MoneyUnit.Satoshi
+                // 4 weight units per byte. See segwit specs.
+                let kwPerKB = 4m
+                let satPerKw = satPerKB / kwPerKB
+                let feeRatePerKw = FeeRatePerKw (uint32 satPerKw)
+                feeRatePerKw
+            MinRelayFee =
+                let btcPerKB = response.minrelaytxfee
+                let satPerKB = (Money (btcPerKB, MoneyUnit.BTC)).ToUnit MoneyUnit.Satoshi
+                // 4 weight units per byte. See segwit specs.
+                let kwPerKB = 4m
+                let satPerKw = satPerKB / kwPerKB
+                let feeRatePerKw = FeeRatePerKw (uint32 satPerKw)
+                feeRatePerKw
+        }
 
     member this.GetBlockHeight (): BlockHeight =
         use bitcoinCli =
@@ -276,7 +329,7 @@ type Bitcoind = {
                 false
         let lines = bitcoinCli.ReadToEnd()
         let output = String.concat "\n" lines
-        Console.WriteLine(sprintf "getblockcount gave us: %s" output)
+        //Console.WriteLine(sprintf "getblockcount gave us: %s" output)
         let height = JsonConvert.DeserializeObject<uint32> output
         BlockHeight height
 
@@ -302,7 +355,7 @@ type Bitcoind = {
                 false
         let lines = bitcoinCli.ReadToEnd()
         let output = String.concat "\n" lines
-        Console.WriteLine(sprintf "getblock gave us: %s" output)
+        //Console.WriteLine(sprintf "getblock gave us: %s" output)
         Block.Parse(output, Network.RegTest)
 
     member this.SetFeeRateForBitcoindTransactions (feeRate: FeeRatePerKw): unit =
@@ -338,8 +391,8 @@ type Bitcoind = {
         setFeeRate()
 
     member this.SignRawTransactionWithWallet (transaction: Transaction): Transaction =
-        Console.WriteLine(sprintf "in SignRawTransactionWithWallet")
-        Console.WriteLine(sprintf "transaction == %A" transaction)
+        //Console.WriteLine(sprintf "in SignRawTransactionWithWallet")
+        //Console.WriteLine(sprintf "transaction == %A" transaction)
         let transactionHex = transaction.ToHex()
         use bitcoinCli =
             ProcessWrapper.New
@@ -350,9 +403,9 @@ type Bitcoind = {
                 false
         let lines = bitcoinCli.ReadToEnd()
         let output = String.concat "\n" lines
-        Console.WriteLine(sprintf "output == %s" output)
+        //Console.WriteLine(sprintf "output == %s" output)
         let response = JsonConvert.DeserializeObject<SignRawTransactionWithWalletResponse> output
-        Console.WriteLine(sprintf "response == %A" response)
+        //Console.WriteLine(sprintf "response == %A" response)
         if response.complete && (Object.ReferenceEquals(response.errors, null) || response.errors.Length = 0) then
             Transaction.Parse(response.hex, Network.RegTest)
         else
@@ -360,7 +413,7 @@ type Bitcoind = {
 
     member this.TrySendRawTransaction (transaction: Transaction): Option<TxId> =
         let transactionHex = transaction.ToHex()
-        Console.WriteLine(sprintf "sending raw transaction: %s" transactionHex)
+        //Console.WriteLine(sprintf "sending raw transaction: %s" transactionHex)
         use bitcoinCli =
             ProcessWrapper.New
                 "bitcoin-cli"
@@ -370,7 +423,7 @@ type Bitcoind = {
                 false
         let lines = bitcoinCli.ReadToEnd()
         let output = (String.concat "\n" lines).Trim()
-        Console.WriteLine(sprintf "sendrawtransaction gave us: %s" output)
+        //Console.WriteLine(sprintf "sendrawtransaction gave us: %s" output)
         if output.StartsWith "error code" then
             None
         else
@@ -387,7 +440,7 @@ type Bitcoind = {
         let lines = bitcoinCli.ReadToEnd()
         let output = String.concat "\n" lines
         let unspentList = JsonConvert.DeserializeObject<list<UnspentResponse>> output
-        Console.WriteLine(sprintf "UNSPENT = %A" unspentList)
+        //Console.WriteLine(sprintf "UNSPENT = %A" unspentList)
         List.map
             (fun (unspent: UnspentResponse) ->
                 Coin(
@@ -400,9 +453,10 @@ type Bitcoind = {
             unspentList
 
     //member this.TrySendFatTx (amount: Money) (size: uint32) (feeRate: FeeRatePerKw): Option<TxId> =
-    member this.TrySendFatTx (unspentCoins: list<Coin>) (amount: Money) (size: uint32) (feeRate: FeeRatePerKw): Option<list<Coin>> =
-        let feeOverEstimate = feeRate.CalculateFeeFromVirtualSize ((uint64 size) * 2UL)
-        let amountWithFee = amount + feeOverEstimate
+    member this.TrySendFatTx (unspentCoins: list<Coin>) (amount: Money) (weight: uint32) (feeRate: FeeRatePerKw): Option<list<Coin>> =
+        let amountWithFee =
+            let feeEstimate = feeRate.CalculateFeeFromWeight (uint64 weight)
+            amount + feeEstimate
         //let unspentCoins = this.ListUnspent()
         let rec collectCoins (total: Money) (acc: list<Coin>) (consume: list<Coin>): Money * list<Coin> * list<Coin> =
             if total > amountWithFee then
@@ -410,7 +464,7 @@ type Bitcoind = {
             else
                 match List.tryHead consume with
                 | Some coin ->
-                    collectCoins (total + coin.Amount) (coin :: acc) (List.tail consume)
+                    collectCoins (total + coin.Amount) (List.append acc [coin]) (List.tail consume)
                 | None -> failwith "not enough funds to send fat tx"
         let total, coins, remainingUnspent = collectCoins Money.Zero List.empty unspentCoins
 
@@ -419,9 +473,10 @@ type Bitcoind = {
             let txIn = TxIn coin.Outpoint
             transaction.Inputs.Add txIn |> ignore
         let txOut =
+            let size = max ((int32 weight) / 4 - 190) 0
             let scriptPubKey =
                 seq {
-                    for _ in 0u .. size do
+                    for _ in 2 .. size do
                         yield Op.op_Implicit OpcodeType.OP_NOP
                     yield Op.GetPushOp 0L
                 }
@@ -429,11 +484,15 @@ type Bitcoind = {
                 |> Script
             TxOut(amount, scriptPubKey)
         transaction.Outputs.Add txOut |> ignore
-        let changeAmount = total - amountWithFee
-        let changeTxOut =
+        let changeAmount = (total - amountWithFee) / 2L
+        let changeTxOut0 =
             let changeAddress = this.GetNewAddress()
             TxOut(changeAmount, changeAddress)
-        transaction.Outputs.Add changeTxOut |> ignore
+        let changeTxOut1 =
+            let changeAddress = this.GetNewAddress()
+            TxOut(changeAmount, changeAddress)
+        transaction.Outputs.Add changeTxOut0 |> ignore
+        transaction.Outputs.Add changeTxOut1 |> ignore
 
         (*
         let transactionBuilder = Network.RegTest.CreateTransactionBuilder()
@@ -454,47 +513,53 @@ type Bitcoind = {
         let transaction = transactionBuilder.BuildTransaction false
         *)
         let signedTransaction = this.SignRawTransactionWithWallet transaction
-        Console.WriteLine(sprintf "sending fat tx of size %i" size)
+        //Console.WriteLine(sprintf "sending fat tx of size %i" size)
         //this.TrySendRawTransaction signedTransaction
         let txIdOpt = this.TrySendRawTransaction signedTransaction
         match txIdOpt with
         | None -> None
         | Some txId ->
-            let newCoin = Coin(txId.Value, 1u, changeAmount, Script.Empty)
-            Some (newCoin :: remainingUnspent)
+            let newCoin0 = Coin(txId.Value, 1u, changeAmount, Script.Empty)
+            let newCoin1 = Coin(txId.Value, 2u, changeAmount, Script.Empty)
+            Some (List.append remainingUnspent [newCoin0; newCoin1])
         
     member this.FillCurrentBlock (feeRate: FeeRatePerKw): unit = 
+        let maxFatTxWeight = 40000u
+        let maxMempoolWeight = 4000000u
+        (*
         let burnAddress =
             let key = new Key()
             let pubKey = key.PubKey
             pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
-        let rec fillBlockWithBurnTxs (txCount: int) =
+        let rec fillBlockWithBurnTxs (mempoolWeight: uint32) =
+            Console.WriteLine(sprintf "FOO - (burning) mempoolWeight == %i" mempoolWeight)
             let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
-            let newTxCount = this.GetTxIdsInMempool().Length
-            if newTxCount > txCount then
-                fillBlockWithBurnTxs newTxCount
+            let newMempoolWeight = this.GetMempoolInfo().TotalWeight
+            Console.WriteLine(sprintf "FOO - (burning) newMempoolWeight == %i" newMempoolWeight)
+            if newMempoolWeight > mempoolWeight && newMempoolWeight < maxMempoolWeight then
+                fillBlockWithBurnTxs newMempoolWeight
+        *)
 
-        let rec fillBlockWithFatTxs (unspentCoins: list<Coin>) (txCount: int) (size: uint32) =
-            //let txIdOpt = this.TrySendFatTx (Money(0.0001m, MoneyUnit.BTC)) size feeRate
-            let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) size feeRate
-            match newUnspentCoinsOpt with
-            | Some newUnspentCoins ->
-                let newTxCount = this.GetTxIdsInMempool().Length
-                if newTxCount > txCount then
-                    fillBlockWithFatTxs newUnspentCoins newTxCount size
-                else
-                    if size <> 0u then
-                        fillBlockWithFatTxs unspentCoins txCount (size / 2u)
-            | None -> ()
+        let rec fillBlockWithFatTxs (unspentCoins: list<Coin>) =
+            let mempoolInfo = this.GetMempoolInfo()
+            Console.WriteLine(sprintf "mempoolinfo == %A" mempoolInfo)
+            let mempoolWeight = mempoolInfo.TotalWeight
+            if mempoolWeight < maxMempoolWeight then
+                let weight = min maxFatTxWeight (maxMempoolWeight - mempoolWeight)
+                //Console.WriteLine(sprintf "FOO - %i unspent coins, mempoolWeight == %i, weight == %i" unspentCoins.Length mempoolWeight weight)
+                let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) weight feeRate
+                match newUnspentCoinsOpt with
+                | Some newUnspentCoins ->
+                    fillBlockWithFatTxs newUnspentCoins
+                | None -> failwith "failed to sent fat tx"
 
         let unspentCoins = this.ListUnspent()
-        let initialTxCount = this.GetTxIdsInMempool().Length
         //fillBlockWithFatTxs initialTxCount 1000000u
-        fillBlockWithFatTxs unspentCoins initialTxCount 10000u
-        //let newTxCount = this.GetTxIdsInMempool().Length
-        //fillBlockWithBurnTxs newTxCount
-        //let finalTxCount = this.GetTxIdsInMempool().Length
-        //failwithf "initialTxCount == %i; newTxCount == %i; finalTxCount == %i" initialTxCount newTxCount finalTxCount
+        fillBlockWithFatTxs unspentCoins
+        //let newMempoolWeight = this.GetMempoolInfo().TotalWeight
+        //fillBlockWithBurnTxs newMempoolWeight
+        //let finalMempoolWeight = this.GetMempoolInfo().TotalWeight
+        //Console.WriteLine(sprintf "initialMempoolWeight == %i; newMempoolWeight == %i; finalMempoolWeight == %i" initialMempoolWeight newMempoolWeight finalMempoolWeight)
 
         (*
         let burnAddress =
@@ -521,17 +586,14 @@ type Bitcoind = {
         bitcoinCli.WaitForExit()
 
     member this.GenerateBlocksWithFeeRate (number: BlockHeightOffset32) (address: BitcoinAddress) (feeRate: FeeRatePerKw) =
-        Console.WriteLine(sprintf "WOWZERS - generating %i blocks" number.Value)
+        Console.WriteLine(sprintf "WOWZERS - generating %i blocks with fee rate %A" number.Value feeRate)
         let rec generateFullBlocks (blockNumber: uint32) =
-            let balance = this.GetBalance()
-            Console.WriteLine(sprintf "WOWZERS - generating block %i, balance %A" blockNumber balance)
             if blockNumber < number.Value then
                 this.FillCurrentBlock feeRate
                 this.GenerateBlocksRaw (BlockHeightOffset32 1u) address
-                let blockHeight = this.GetBlockHeight()
-                let blockHash = this.GetBlockHash blockHeight
-                let block = this.GetBlock blockHash
-                Console.WriteLine(sprintf "BLOCK: %A" block)
+                //let blockHeight = this.GetBlockHeight()
+                //let blockHash = this.GetBlockHash blockHeight
+                //let block = this.GetBlock blockHash
                 generateFullBlocks (blockNumber + 1u)
         generateFullBlocks 0u
 
@@ -1768,12 +1830,13 @@ type LN() =
             failwith "incorrect balance after receiving payment 1"
 
         let rec checkForClosingTx() = async {
-            let! txIdOpt = Lightning.Network.CheckForChannelFraudAndSendRevocationTx walletInstance.Node channelId
-            match txIdOpt with
+            let! txStringOpt = Lightning.Network.CheckForClosingTx walletInstance.Node channelId
+            match txStringOpt with
             | None ->
                 do! Async.Sleep 500
                 return! checkForClosingTx()
-            | Some _ ->
+            | Some txString ->
+                let! _txIdString = UtxoCoin.Account.BroadcastRawTransaction Currency.BTC txString
                 return ()
         }
         do! checkForClosingTx()

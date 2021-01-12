@@ -279,11 +279,18 @@ type Bitcoind = {
         }
         let selfAddress = ret.GetNewAddress()
         ret.GenerateBlocksRaw
-            // TODO: split coins instead of making this 20
-            (BlockHeightOffset32 (20u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
+            // TODO: Why does this have to be so high?  I think because it
+            // needs lots of txouts to use. Try to first mine a tx that splits
+            // our funds into a whole bunch of txouts and see if we can then
+            // reduce this to something sane.
+            (BlockHeightOffset32 (550u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
+            //(BlockHeightOffset32 (55u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
             selfAddress
         ret.SetFeeRateByMining defaultFeeRate
         ret
+
+    //member private this.RunCommand<'R> (): 'R =
+
 
     member this.GetMempoolInfo (): MempoolInfo =
         use bitcoinCli =
@@ -319,6 +326,7 @@ type Bitcoind = {
                 feeRatePerKw
         }
 
+    (*
     member this.GetBlockHeight (): BlockHeight =
         use bitcoinCli =
             ProcessWrapper.New
@@ -332,7 +340,9 @@ type Bitcoind = {
         //Console.WriteLine(sprintf "getblockcount gave us: %s" output)
         let height = JsonConvert.DeserializeObject<uint32> output
         BlockHeight height
+    *)
 
+    (*
     member this.GetBlockHash (blockHeight: BlockHeight): uint256 =
         use bitcoinCli =
             ProcessWrapper.New
@@ -344,7 +354,9 @@ type Bitcoind = {
         let lines = bitcoinCli.ReadToEnd()
         let output = String.concat "\n" lines
         uint256 output
+    *)
 
+    (*
     member this.GetBlock (blockHash: uint256): Block =
         use bitcoinCli =
             ProcessWrapper.New
@@ -357,6 +369,7 @@ type Bitcoind = {
         let output = String.concat "\n" lines
         //Console.WriteLine(sprintf "getblock gave us: %s" output)
         Block.Parse(output, Network.RegTest)
+    *)
 
     member this.SetFeeRateForBitcoindTransactions (feeRate: FeeRatePerKw): unit =
         let feeRateDecimal =
@@ -379,16 +392,17 @@ type Bitcoind = {
 
     member this.SetFeeRateByMining (feeRate: FeeRatePerKw): unit =
         let address = this.GetNewAddress()
-        this.SetFeeRateForBitcoindTransactions feeRate
-        let rec setFeeRate () =
+        let rec setFeeRate (attemptNum: int) =
+            if attemptNum >= 20 then
+                failwith "Setting fee rate by mining isn't working for some reason..."
             let currentFeeRate = this.EstimateSmartFee (BlockHeightOffset16 6us)
             Console.WriteLine(sprintf "FEERATE: target == %A, current == %A" feeRate currentFeeRate)
             match currentFeeRate with
             | Some currentFeeRate when currentFeeRate >= feeRate -> ()
             | _ ->
                 this.GenerateBlocksWithFeeRate (BlockHeightOffset32 1u) address feeRate
-                setFeeRate()
-        setFeeRate()
+                setFeeRate (attemptNum + 1)
+        setFeeRate 0
 
     member this.SignRawTransactionWithWallet (transaction: Transaction): Transaction =
         //Console.WriteLine(sprintf "in SignRawTransactionWithWallet")
@@ -454,12 +468,13 @@ type Bitcoind = {
 
     //member this.TrySendFatTx (amount: Money) (size: uint32) (feeRate: FeeRatePerKw): Option<TxId> =
     member this.TrySendFatTx (unspentCoins: list<Coin>) (amount: Money) (weight: uint32) (feeRate: FeeRatePerKw): Option<list<Coin>> =
-        let amountWithFee =
-            let feeEstimate = feeRate.CalculateFeeFromWeight (uint64 weight)
-            amount + feeEstimate
+        let amountWithFeeOverEstimate =
+            let minWeight = 1000UL
+            let feeOverEstimate = feeRate.CalculateFeeFromWeight (minWeight + uint64 weight)
+            amount + feeOverEstimate
         //let unspentCoins = this.ListUnspent()
         let rec collectCoins (total: Money) (acc: list<Coin>) (consume: list<Coin>): Money * list<Coin> * list<Coin> =
-            if total > amountWithFee then
+            if total > amountWithFeeOverEstimate then
                 total, acc, consume
             else
                 match List.tryHead consume with
@@ -467,85 +482,180 @@ type Bitcoind = {
                     collectCoins (total + coin.Amount) (List.append acc [coin]) (List.tail consume)
                 | None -> failwith "not enough funds to send fat tx"
         let total, coins, remainingUnspent = collectCoins Money.Zero List.empty unspentCoins
-
-        let transaction = Network.RegTest.CreateTransaction()
-        for coin in coins do
-            let txIn = TxIn coin.Outpoint
-            transaction.Inputs.Add txIn |> ignore
-        let txOut =
-            let size = max ((int32 weight) / 4 - 190) 0
-            let scriptPubKey =
-                seq {
-                    for _ in 2 .. size do
-                        yield Op.op_Implicit OpcodeType.OP_NOP
-                    yield Op.GetPushOp 0L
-                }
-                |> List.ofSeq
-                |> Script
-            TxOut(amount, scriptPubKey)
-        transaction.Outputs.Add txOut |> ignore
-        let changeAmount = (total - amountWithFee) / 2L
-        let changeTxOut0 =
-            let changeAddress = this.GetNewAddress()
-            TxOut(changeAmount, changeAddress)
-        let changeTxOut1 =
-            let changeAddress = this.GetNewAddress()
-            TxOut(changeAmount, changeAddress)
-        transaction.Outputs.Add changeTxOut0 |> ignore
-        transaction.Outputs.Add changeTxOut1 |> ignore
-
         (*
-        let transactionBuilder = Network.RegTest.CreateTransactionBuilder()
-        transactionBuilder.DustPrevention <- false
-        let changeAddress = this.GetNewAddress()
-        transactionBuilder.SetChange changeAddress |> ignore
-        for coin in coins do
-            transactionBuilder.AddCoins coin |> ignore
-        let scriptPubKey =
-            seq {
-                for _ in 0u .. size do
-                    yield Op.op_Implicit OpcodeType.OP_NOP
-                yield Op.GetPushOp 0L
-            }
-            |> List.ofSeq
-            |> Script
-        transactionBuilder.Send(scriptPubKey, amount) |> ignore
-        let transaction = transactionBuilder.BuildTransaction false
+        let valueUnspent =
+            List.fold
+                (fun totalUnspent, unspentCoin -> totalUnspent + unspentCoin.Amount)
+                Money.Zero
+                remainingUnspent
         *)
-        let signedTransaction = this.SignRawTransactionWithWallet transaction
+
+        let rec makeFatTx (minFeeOpt: Option<Money>) (maxFeeOpt: Option<Money>) (attemptedFee: Money): Transaction * list<Money> =
+            let transaction = Network.RegTest.CreateTransaction()
+            for coin in coins do
+                let txIn = TxIn coin.Outpoint
+                transaction.Inputs.Add txIn |> ignore
+            let txOut =
+                let size = (int32 weight) / 4
+                let scriptPubKey =
+                    seq {
+                        for _ in 2 .. size do
+                            yield Op.op_Implicit OpcodeType.OP_NOP
+                        yield Op.GetPushOp 0L
+                    }
+                    |> List.ofSeq
+                    |> Script
+                TxOut(amount, scriptPubKey)
+            transaction.Outputs.Add txOut |> ignore
+            let changeAmounts =
+                if remainingUnspent.Length < 100 then
+                    let changeAmount = (total - (amount + attemptedFee)) / 2L
+                    let changeTxOut0 =
+                        let changeAddress = this.GetNewAddress()
+                        TxOut(changeAmount, changeAddress)
+                    let changeTxOut1 =
+                        let changeAddress = this.GetNewAddress()
+                        TxOut(changeAmount, changeAddress)
+                    transaction.Outputs.Add changeTxOut0 |> ignore
+                    transaction.Outputs.Add changeTxOut1 |> ignore
+                    [changeAmount; changeAmount]
+                else
+                    let changeAmount = total - (amount + attemptedFee)
+                    let changeTxOut =
+                        let changeAddress = this.GetNewAddress()
+                        TxOut(changeAmount, changeAddress)
+                    transaction.Outputs.Add changeTxOut |> ignore
+                    [changeAmount]
+            let signedTransaction = this.SignRawTransactionWithWallet transaction
+            let actualWeight = (int64 <| signedTransaction.GetVirtualSize()) * 4L
+            let totalOut =
+                Seq.fold
+                    (fun (total: Money) (output: TxOut) -> total + output.Value)
+                    Money.Zero
+                    signedTransaction.Outputs
+            assert
+                let totalIn =
+                    Seq.fold
+                        (fun (total: Money) (input: TxIn) -> 
+                            let coin =
+                                Seq.exactlyOne <| Seq.filter (fun (coin: Coin) -> coin.Outpoint = input.PrevOut) unspentCoins
+                            total + coin.Amount
+                        )
+                        Money.Zero
+                        signedTransaction.Inputs
+                totalIn = total
+            let actualFee = total - totalOut
+            let actualFeeRate = FeeRatePerKw <| uint32 (actualFee.Satoshi * 1000L / actualWeight)
+            if actualFeeRate > feeRate then
+                let nextMaxFee =
+                    match maxFeeOpt with
+                    | Some maxFee -> min maxFee attemptedFee
+                    | None -> attemptedFee + Money(1m, MoneyUnit.Satoshi)
+                let adjustedFee = Money((attemptedFee.ToDecimal MoneyUnit.Satoshi) * (decimal feeRate.Value) / (decimal actualFeeRate.Value), MoneyUnit.Satoshi)
+                let nextAttemptedFee =
+                    match minFeeOpt with
+                    | Some minFee -> max minFee adjustedFee
+                    | None -> adjustedFee
+                if nextAttemptedFee < nextMaxFee then
+                    makeFatTx minFeeOpt (Some nextMaxFee) nextAttemptedFee
+                else
+                    (signedTransaction, changeAmounts)
+            elif actualFeeRate < feeRate then
+                let nextMinFee =
+                    match minFeeOpt with
+                    | Some minFee -> max minFee attemptedFee
+                    | None -> attemptedFee + Money(1m, MoneyUnit.Satoshi)
+                let adjustedFee = Money((attemptedFee.ToDecimal MoneyUnit.Satoshi) * (decimal feeRate.Value) / (decimal actualFeeRate.Value), MoneyUnit.Satoshi)
+                let nextAttemptedFee =
+                    match maxFeeOpt with
+                    | Some maxFee -> min maxFee adjustedFee
+                    | None -> adjustedFee
+                if nextAttemptedFee > nextMinFee then
+                    makeFatTx (Some nextMinFee) maxFeeOpt nextAttemptedFee
+                else
+                    (signedTransaction, changeAmounts)
+            else
+                (signedTransaction, changeAmounts)
+
+        let signedTransaction, changeAmounts = makeFatTx None None (feeRate.CalculateFeeFromWeight (uint64 weight))
+
+
+
+        // TODO: remove these checks
+
+        let actualWeight = (int64 <| signedTransaction.GetVirtualSize()) * 4L
+        let totalOut =
+            Seq.fold
+                (fun (total: Money) (output: TxOut) -> total + output.Value)
+                Money.Zero
+                signedTransaction.Outputs
+        let totalIn =
+            Seq.fold
+                (fun (total: Money) (input: TxIn) -> 
+                    let coin =
+                        Seq.exactlyOne <| Seq.filter (fun (coin: Coin) -> coin.Outpoint = input.PrevOut) unspentCoins
+                    total + coin.Amount
+                )
+                Money.Zero
+                signedTransaction.Inputs
+        let actualFee = totalIn - totalOut
+        let actualFeeRate = actualFee.Satoshi * 1000L / actualWeight
+        Console.WriteLine(sprintf "ZORK: actualWeight == %A; weight == %A" actualWeight weight)
+        Console.WriteLine(sprintf "ZORK: totalOut == %A; totalIn == %A; actualFee == %A" totalOut totalIn actualFee)
+        Console.WriteLine(sprintf "ZORK: actualFeeRate == %A; feeRate == %A" actualFeeRate feeRate.Value)
+        if (float actualFeeRate) < (float feeRate.Value) * 0.95 || (float actualFeeRate) > (float feeRate.Value) * 1.05 then
+            failwithf "oh dear"
+
         //Console.WriteLine(sprintf "sending fat tx of size %i" size)
         //this.TrySendRawTransaction signedTransaction
         let txIdOpt = this.TrySendRawTransaction signedTransaction
         match txIdOpt with
         | None -> None
         | Some txId ->
-            let newCoin0 = Coin(txId.Value, 1u, changeAmount, Script.Empty)
-            let newCoin1 = Coin(txId.Value, 2u, changeAmount, Script.Empty)
-            Some (List.append remainingUnspent [newCoin0; newCoin1])
+            let newCoins, _finalTxOutIndex =
+                List.mapFold
+                    (fun txOutIndex changeAmount ->
+                        (Coin(txId.Value, txOutIndex, changeAmount, Script.Empty), txOutIndex + 1u)
+                    )
+                    1u
+                    changeAmounts
+            Some <| List.append remainingUnspent newCoins
         
     member this.FillCurrentBlock (feeRate: FeeRatePerKw): unit = 
         let maxFatTxWeight = 40000u
         let maxMempoolWeight = 4000000u
-        (*
+        let mempoolBurnTxWeight = maxMempoolWeight / 100u
+        let mempoolFatTxWeight = maxMempoolWeight + mempoolBurnTxWeight
+
+        let initialMempoolWeight = this.GetMempoolInfo().TotalWeight
+        Console.WriteLine(sprintf "BLAH: initialMempoolWeight == %A" initialMempoolWeight)
+
         let burnAddress =
             let key = new Key()
             let pubKey = key.PubKey
             pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
-        let rec fillBlockWithBurnTxs (mempoolWeight: uint32) =
-            Console.WriteLine(sprintf "FOO - (burning) mempoolWeight == %i" mempoolWeight)
-            let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
-            let newMempoolWeight = this.GetMempoolInfo().TotalWeight
-            Console.WriteLine(sprintf "FOO - (burning) newMempoolWeight == %i" newMempoolWeight)
-            if newMempoolWeight > mempoolWeight && newMempoolWeight < maxMempoolWeight then
-                fillBlockWithBurnTxs newMempoolWeight
-        *)
+        let rec fillBlockWithBurnTxs (prevMempoolWeightOpt: Option<uint32>) =
+            Console.WriteLine(sprintf "prevMempoolWeightOpt == %A" prevMempoolWeightOpt)
+            let mempoolWeight = this.GetMempoolInfo().TotalWeight
+            match prevMempoolWeightOpt with
+            | Some prevMempoolWeight ->
+                assert (prevMempoolWeight < mempoolWeight)
+            | None -> ()
+            if mempoolWeight < mempoolBurnTxWeight then
+                let adjustedFeeRate = 
+                    let adjustment = 0.9 + 0.2 * (new Random()).NextDouble()
+                    FeeRatePerKw <| uint32 ((double feeRate.Value) * adjustment)
+                this.SetFeeRateForBitcoindTransactions adjustedFeeRate
+                let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
+                fillBlockWithBurnTxs (Some mempoolWeight)
 
         let rec fillBlockWithFatTxs (unspentCoins: list<Coin>) =
+            Console.WriteLine(sprintf "getting mempool info")
             let mempoolInfo = this.GetMempoolInfo()
             Console.WriteLine(sprintf "mempoolinfo == %A" mempoolInfo)
             let mempoolWeight = mempoolInfo.TotalWeight
-            if mempoolWeight < maxMempoolWeight then
-                let weight = min maxFatTxWeight (maxMempoolWeight - mempoolWeight)
+            if mempoolWeight < mempoolFatTxWeight then
+                let weight = min maxFatTxWeight (mempoolFatTxWeight - mempoolWeight)
                 //Console.WriteLine(sprintf "FOO - %i unspent coins, mempoolWeight == %i, weight == %i" unspentCoins.Length mempoolWeight weight)
                 let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) weight feeRate
                 match newUnspentCoinsOpt with
@@ -553,6 +663,8 @@ type Bitcoind = {
                     fillBlockWithFatTxs newUnspentCoins
                 | None -> failwith "failed to sent fat tx"
 
+        Console.WriteLine(sprintf "listing unspent coins")
+        fillBlockWithBurnTxs None
         let unspentCoins = this.ListUnspent()
         //fillBlockWithFatTxs initialTxCount 1000000u
         fillBlockWithFatTxs unspentCoins
@@ -589,7 +701,9 @@ type Bitcoind = {
         Console.WriteLine(sprintf "WOWZERS - generating %i blocks with fee rate %A" number.Value feeRate)
         let rec generateFullBlocks (blockNumber: uint32) =
             if blockNumber < number.Value then
+                Console.WriteLine(sprintf "Filling current block")
                 this.FillCurrentBlock feeRate
+                Console.WriteLine(sprintf "generating raw blocks")
                 this.GenerateBlocksRaw (BlockHeightOffset32 1u) address
                 //let blockHeight = this.GetBlockHeight()
                 //let blockHash = this.GetBlockHash blockHeight

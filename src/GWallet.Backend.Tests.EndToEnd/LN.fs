@@ -278,19 +278,30 @@ type Bitcoind = {
             ProcessWrapper = processWrapper
         }
         let selfAddress = ret.GetNewAddress()
+
+        let initialBlocks = 10u
         ret.GenerateBlocksRaw
-            // TODO: Why does this have to be so high?  I think because it
-            // needs lots of txouts to use. Try to first mine a tx that splits
-            // our funds into a whole bunch of txouts and see if we can then
-            // reduce this to something sane.
-            (BlockHeightOffset32 (550u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
-            //(BlockHeightOffset32 (55u + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
+            (BlockHeightOffset32 (initialBlocks + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
             selfAddress
+        for i in 0 .. 20 do
+            let utxoCount = ret.ListUnspent().Length
+            Console.WriteLine(sprintf "UTXOS: doing initial split %i. Have %i utxos" i utxoCount)
+            ret.SplitUtxo()
+            ret.GenerateBlocksRaw
+                (BlockHeightOffset32 1u)
+                selfAddress
         ret.SetFeeRateByMining defaultFeeRate
         ret
 
-    //member private this.RunCommand<'R> (): 'R =
-
+    member private this.SplitUtxo(): unit =
+        for _ in 1 .. 4 do
+            seq {
+                for _ in 1 .. 500 do
+                    yield (this.GetNewAddress(), Money(0.01m, MoneyUnit.BTC))
+            }
+            |> List.ofSeq
+            |> this.SendMany
+            |> ignore
 
     member this.GetMempoolInfo (): MempoolInfo =
         use bitcoinCli =
@@ -387,6 +398,7 @@ type Bitcoind = {
                 false
         let lines = bitcoinCli.ReadToEnd()
         let output = String.concat "\n" lines
+        Console.WriteLine(sprintf "SetFeeRateForBitcoindTransactions gave %s" output)
         let success = JsonConvert.DeserializeObject<bool> output
         assert success
 
@@ -403,6 +415,7 @@ type Bitcoind = {
                 this.GenerateBlocksWithFeeRate (BlockHeightOffset32 1u) address feeRate
                 setFeeRate (attemptNum + 1)
         setFeeRate 0
+        this.SetFeeRateForBitcoindTransactions feeRate
 
     member this.SignRawTransactionWithWallet (transaction: Transaction): Transaction =
         //Console.WriteLine(sprintf "in SignRawTransactionWithWallet")
@@ -439,16 +452,28 @@ type Bitcoind = {
         let output = (String.concat "\n" lines).Trim()
         //Console.WriteLine(sprintf "sendrawtransaction gave us: %s" output)
         if output.StartsWith "error code" then
+            Console.WriteLine(sprintf "sendrawtransaction gave us: %s" output)
             None
         else
             output |> uint256 |> TxId |> Some
 
-    member this.ListUnspent (): list<Coin> =
+    member this.ListUnspent (minConfirmationsOpt: Option<BlockHeightOffset32>)
+                            (maxConfirmationsOpt: Option<BlockHeightOffset32>)
+                            (includeUnsafe: bool)
+                                : list<Coin> =
+        let minConfirmations =
+            match minConfirmationsOpt with
+            | Some minConfirmations -> minConfirmations.Value
+            | None -> 6u
+        let maxConfirmations =
+            match maxConfirmationsOpt with
+            | Some maxConfirmations -> maxConfirmations.Value
+            | None -> 9999999u
         use bitcoinCli =
             ProcessWrapper.New
                 "bitcoin-cli"
                 this.WorkDir
-                (SPrintF1 "-regtest -datadir=%s listunspent" this.DataDir)
+                (SPrintF1 "-regtest -datadir=%s listunspent %i %i [] %A" this.DataDir minConfirmations maxConfirmations includeUnsafe)
                 Map.empty
                 false
         let lines = bitcoinCli.ReadToEnd()
@@ -622,34 +647,43 @@ type Bitcoind = {
             Some <| List.append remainingUnspent newCoins
         
     member this.FillCurrentBlock (feeRate: FeeRatePerKw): unit = 
+        let utxoCount = this.ListUnspent().Length
+        Console.WriteLine(sprintf "UTXOS: filling block starting with %i utxos" utxoCount)
+        if utxoCount < 4000 then
+            this.SplitUtxo()
+            let blahUtxoCount = this.ListUnspent().Length
+            Console.WriteLine(sprintf "UTXOS: after splitting, have %i utxos" blahUtxoCount)
+
+        let erfinv (x: double): double =
+            let sgn = if x < 0.0 then -1.0 else 1.0
+            let thing = (1.0 - x) * (1.0 + x)
+            let lnthing = Math.Log thing
+            let tt1 = 4.33074675079987754643 + 0.5 * lnthing
+            let tt2 = 6.80272108843537414966 * lnthing
+            sgn * Math.Sqrt(-tt1 + Math.Sqrt(tt1 * tt1 - tt2))
+
         let maxFatTxWeight = 40000u
         let maxMempoolWeight = 4000000u
         let mempoolBurnTxWeight = maxMempoolWeight / 100u
         let mempoolFatTxWeight = maxMempoolWeight + mempoolBurnTxWeight
 
-        let initialMempoolWeight = this.GetMempoolInfo().TotalWeight
-        Console.WriteLine(sprintf "BLAH: initialMempoolWeight == %A" initialMempoolWeight)
-
         let burnAddress =
             let key = new Key()
             let pubKey = key.PubKey
             pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
-        let rec fillBlockWithBurnTxs (prevMempoolWeightOpt: Option<uint32>) =
-            Console.WriteLine(sprintf "prevMempoolWeightOpt == %A" prevMempoolWeightOpt)
+        let rec fillBlockWithBurnTxs (): unit =
             let mempoolWeight = this.GetMempoolInfo().TotalWeight
-            match prevMempoolWeightOpt with
-            | Some prevMempoolWeight ->
-                assert (prevMempoolWeight < mempoolWeight)
-            | None -> ()
             if mempoolWeight < mempoolBurnTxWeight then
                 let adjustedFeeRate = 
-                    let adjustment = 0.9 + 0.2 * (new Random()).NextDouble()
+                    //let adjustment = 0.9 + 0.2 * (new Random()).NextDouble()
+                    let adjustment = Math.Exp(Math.Sqrt(2.0) * erfinv(2.0 * (new Random()).NextDouble() - 1.0))
                     FeeRatePerKw <| uint32 ((double feeRate.Value) * adjustment)
                 this.SetFeeRateForBitcoindTransactions adjustedFeeRate
                 let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
-                fillBlockWithBurnTxs (Some mempoolWeight)
+                fillBlockWithBurnTxs()
 
-        let rec fillBlockWithFatTxs (unspentCoins: list<Coin>) =
+        //let rec fillBlockWithFatTxs (unspentCoins: list<Coin>): unit =
+        let rec fillBlockWithFatTxs (): unit =
             Console.WriteLine(sprintf "getting mempool info")
             let mempoolInfo = this.GetMempoolInfo()
             Console.WriteLine(sprintf "mempoolinfo == %A" mempoolInfo)
@@ -657,34 +691,65 @@ type Bitcoind = {
             if mempoolWeight < mempoolFatTxWeight then
                 let weight = min maxFatTxWeight (mempoolFatTxWeight - mempoolWeight)
                 //Console.WriteLine(sprintf "FOO - %i unspent coins, mempoolWeight == %i, weight == %i" unspentCoins.Length mempoolWeight weight)
+                let unspentCoins = this.ListUnspent()
+                Console.WriteLine(sprintf "UTXOS: sending fat tx with %i utxos" unspentCoins.Length)
                 let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) weight feeRate
                 match newUnspentCoinsOpt with
-                | Some newUnspentCoins ->
-                    fillBlockWithFatTxs newUnspentCoins
-                | None -> failwith "failed to sent fat tx"
+                | Some _newUnspentCoins ->
+                    //fillBlockWithFatTxs newUnspentCoins
+                    fillBlockWithFatTxs()
+                | None -> failwith "failed to send fat tx"
 
-        Console.WriteLine(sprintf "listing unspent coins")
-        fillBlockWithBurnTxs None
-        let unspentCoins = this.ListUnspent()
-        //fillBlockWithFatTxs initialTxCount 1000000u
-        fillBlockWithFatTxs unspentCoins
-        //let newMempoolWeight = this.GetMempoolInfo().TotalWeight
-        //fillBlockWithBurnTxs newMempoolWeight
-        //let finalMempoolWeight = this.GetMempoolInfo().TotalWeight
-        //Console.WriteLine(sprintf "initialMempoolWeight == %i; newMempoolWeight == %i; finalMempoolWeight == %i" initialMempoolWeight newMempoolWeight finalMempoolWeight)
-
+        fillBlockWithBurnTxs()
+        let afterBurnUtxoCount = this.ListUnspent().Length
+        Console.WriteLine(sprintf "UTXOS: after burning, have %i utxos" afterBurnUtxoCount)
+        //fillBlockWithFatTxs unspentCoins
+        fillBlockWithFatTxs ()
+        let afterFatUtxoCount = this.ListUnspent().Length
+        Console.WriteLine(sprintf "UTXOS: after fattening, have %i utxos" afterFatUtxoCount)
         (*
+        let maxFatTxWeight = 40000u
+        let maxMempoolWeight = 4000000u
+        let mempoolBurnTxWeight = maxMempoolWeight / 100u
+
         let burnAddress =
             let key = new Key()
             let pubKey = key.PubKey
             pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
-        let rec fillBlock (txCount: int) =
-            let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
-            let newTxCount = this.GetTxIdsInMempool().Length
-            if newTxCount > txCount then
-                fillBlock newTxCount
-        let initialTxCount = this.GetTxIdsInMempool().Length
-        fillBlock initialTxCount
+        let rec fillBlockWithBurnTxs (prevMempoolWeight: uint32) (targetMempoolWeight: uint32): unit =
+            Console.WriteLine(sprintf "prevMempoolWeight == %A" prevMempoolWeight)
+            let mempoolWeight = this.GetMempoolInfo().TotalWeight
+            assert (prevMempoolWeight < mempoolWeight)
+            if mempoolWeight < targetMempoolWeight then
+                let adjustedFeeRate = 
+                    //let adjustment = 0.9 + 0.2 * (new Random()).NextDouble()
+                    let adjustment = Math.Exp(Math.Sqrt(2.0) * erfinv(2.0 * (new Random()).NextDouble() - 1.0))
+                    FeeRatePerKw <| uint32 ((double feeRate.Value) * adjustment)
+                this.SetFeeRateForBitcoindTransactions adjustedFeeRate
+                let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
+                fillBlockWithBurnTxs mempoolWeight targetMempoolWeight
+
+        let rec fillBlockWithFatTxs (unspentCoins: list<Coin>) (targetMempoolWeight: uint32) =
+            Console.WriteLine(sprintf "getting mempool info")
+            let mempoolInfo = this.GetMempoolInfo()
+            Console.WriteLine(sprintf "mempoolinfo == %A" mempoolInfo)
+            let mempoolWeight = mempoolInfo.TotalWeight
+            if mempoolWeight < targetMempoolWeight then
+                let weight = min maxFatTxWeight (targetMempoolWeight - mempoolWeight)
+                //Console.WriteLine(sprintf "FOO - %i unspent coins, mempoolWeight == %i, weight == %i" unspentCoins.Length mempoolWeight weight)
+                let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) weight feeRate
+                match newUnspentCoinsOpt with
+                | Some newUnspentCoins ->
+                    fillBlockWithFatTxs newUnspentCoins targetMempoolWeight
+                | None -> failwith "failed to send fat tx"
+
+        let initialMempoolWeight = this.GetMempoolInfo().TotalWeight
+        Console.WriteLine(sprintf "BLAH: initialMempoolWeight == %A" initialMempoolWeight)
+        fillBlockWithBurnTxs initialMempoolWeight (initialMempoolWeight + mempoolBurnTxWeight)
+
+        Console.WriteLine(sprintf "listing unspent coins")
+        let unspentCoins = this.ListUnspent()
+        fillBlockWithFatTxs unspentCoins (initialMempoolWeight + maxMempoolWeight)
         *)
 
     member this.GenerateBlocksRaw (number: BlockHeightOffset32) (address: BitcoinAddress) =
@@ -719,6 +784,24 @@ type Bitcoind = {
     member this.GenerateBlocksToSelf (number: BlockHeightOffset32) =
         let address = this.GetNewAddress()
         this.GenerateBlocks number address
+
+    member this.GenerateBlocksToCompletion<'T> (job: Async<'T>): Async<'T> = async {
+        use cancellationTokenSource = new CancellationTokenSource()
+        let cancellationToken = cancellationTokenSource.Token
+        let rec generateBlocks() = async {
+            if cancellationToken.IsCancellationRequested then
+                ()
+            else
+                this.GenerateBlocksToSelf (BlockHeightOffset32 1u)
+                return! generateBlocks()
+        }
+        use! _handler = Async.OnCancel (fun() -> cancellationTokenSource.Cancel())
+        let! child = Async.StartChild (generateBlocks())
+        let! ret = job
+        cancellationTokenSource.Cancel()
+        do! child
+        return ret
+    }
 
     member this.GetTxIdsInMempool(): list<TxId> =
         use bitcoinCli =
@@ -821,6 +904,27 @@ type Bitcoind = {
             | _ ->
                 failwithf "got this from sendtoaddress == %s" txIdString
         TxId <| wowzers
+
+    member this.SendMany (addresses: list<BitcoinAddress * Money>): TxId =
+        let addressesJson =
+            addresses
+            |> List.toSeq
+            |> Seq.map (fun (address, amount) -> (address.ToString(), amount.ToUnit MoneyUnit.BTC))
+            |> Map.ofSeq
+            |> fun addresses -> JsonConvert.SerializeObject(addresses)
+            |> fun addresses -> addresses.Replace("\"", "\\\"")
+        Console.WriteLine(sprintf "sending this: %s" addressesJson)
+        use bitcoinCli =
+            ProcessWrapper.New
+                "bitcoin-cli"
+                this.WorkDir
+                (SPrintF2 "-regtest -datadir=%s sendmany \"\" %s" this.DataDir addressesJson)
+                Map.empty
+                false
+        let lines = bitcoinCli.ReadToEnd()
+        let txIdString = (String.concat "\n" lines).Trim()
+        Console.WriteLine(sprintf "got this: %s" txIdString)
+        TxId <| uint256 txIdString
 
     member this.RpcUrl: string =
         SPrintF2 "http://%s:%s@127.0.0.1:18554" this.RpcUser this.RpcPassword
@@ -1231,6 +1335,7 @@ type LN() =
         Console.WriteLine(sprintf "FUNDER - UUU")
         *)
 
+        (*
         // We want to make sure Geewallet consideres the money received.
         // A typical number of blocks that is almost universally considered
         // 100% confirmed, is 6. Therefore we mine 7 blocks. Because we have
@@ -1244,15 +1349,14 @@ type LN() =
         let consideredConfirmedAmountOfBlocksPlusOne = BlockHeightOffset32 7u
         bitcoind.GenerateBlocksToSelf consideredConfirmedAmountOfBlocksPlusOne
         Console.WriteLine(sprintf "FUNDER - III")
+        *)
 
         let fundingAmount = Money(0.1m, MoneyUnit.BTC)
-        let! transferAmount = async {
+        let! transferAmount = bitcoind.GenerateBlocksToCompletion <| async {
             let! accountBalance = walletInstance.WaitForBalance fundingAmount
             return TransferAmount (fundingAmount.ToDecimal MoneyUnit.BTC, accountBalance.ToDecimal MoneyUnit.BTC, Currency.BTC)
         }
         Console.WriteLine(sprintf "FUNDER - OOO")
-        let wowzers = bitcoind.EstimateSmartFee (BlockHeightOffset16 1us)
-        Console.WriteLine(sprintf "FUNDER - fee is currently %A" wowzers)
         let! metadata = ChannelManager.EstimateChannelOpeningFee (walletInstance.Account :?> NormalUtxoAccount) transferAmount
         Console.WriteLine(sprintf "FUNDER - PPP")
         let! pendingChannelRes =
@@ -1264,36 +1368,35 @@ type LN() =
                 walletInstance.Password
         Console.WriteLine(sprintf "FUNDER - AAA")
         let pendingChannel = UnwrapResult pendingChannelRes "OpenChannel failed"
-        let minimumDepth = (pendingChannel :> IChannelToBeOpened).ConfirmationsRequired
+        //let minimumDepth = (pendingChannel :> IChannelToBeOpened).ConfirmationsRequired
         let channelId = (pendingChannel :> IChannelToBeOpened).ChannelId
         let! fundingTxIdRes = pendingChannel.Accept()
         Console.WriteLine(sprintf "FUNDER - SSS")
         let _fundingTxId = UnwrapResult fundingTxIdRes "pendingChannel.Accept failed"
         Console.WriteLine(sprintf "FUNDER - DDD")
-        bitcoind.GenerateBlocksToSelf (BlockHeightOffset32 minimumDepth)
-        Console.WriteLine(sprintf "FUNDER - FFF")
 
-        do!
-            let channelInfo = walletInstance.ChannelStore.ChannelInfo channelId
-            let fundingBroadcastButNotLockedData =
-                match channelInfo.Status with
-                | ChannelStatus.FundingBroadcastButNotLocked fundingBroadcastButNotLockedData
-                    -> fundingBroadcastButNotLockedData
-                | status -> failwith (SPrintF1 "Unexpected channel status. Expected FundingBroadcastButNotLocked, got %A" status)
-            let rec waitForFundingConfirmed() = async {
-                let! remainingConfirmations = fundingBroadcastButNotLockedData.GetRemainingConfirmations()
-                if remainingConfirmations > 0u then
-                    do! Async.Sleep 1000
-                    return! waitForFundingConfirmed()
-                else
-                    // TODO: the backend API doesn't give us any way to avoid
-                    // the FundingOnChainLocationUnknown error, so just sleep
-                    // to avoid the race condition. This waiting should really
-                    // be implemented on the backend anyway.
-                    do! Async.Sleep 10000
-                    return ()
-            }
-            waitForFundingConfirmed()
+        let channelInfo = walletInstance.ChannelStore.ChannelInfo channelId
+        let fundingBroadcastButNotLockedData =
+            match channelInfo.Status with
+            | ChannelStatus.FundingBroadcastButNotLocked fundingBroadcastButNotLockedData
+                -> fundingBroadcastButNotLockedData
+            | status -> failwith (SPrintF1 "Unexpected channel status. Expected FundingBroadcastButNotLocked, got %A" status)
+        let rec waitForFundingConfirmed() = async {
+            let! remainingConfirmations = fundingBroadcastButNotLockedData.GetRemainingConfirmations()
+            if remainingConfirmations > 0u then
+                do! Async.Sleep 1000
+                return! waitForFundingConfirmed()
+            else
+                // TODO: the backend API doesn't give us any way to avoid
+                // the FundingOnChainLocationUnknown error, so just sleep
+                // to avoid the race condition. This waiting should really
+                // be implemented on the backend anyway.
+                do! Async.Sleep 10000
+                return ()
+        }
+
+        do! bitcoind.GenerateBlocksToCompletion <| waitForFundingConfirmed()
+
         Console.WriteLine(sprintf "FUNDER - GGG")
 
         let! lockFundingRes = Lightning.Network.LockChannelFunding walletInstance.Node channelId
@@ -1317,6 +1420,8 @@ type LN() =
                 transferAmount
         UnwrapResult sendMonoHopPayment0Res "SendMonoHopPayment failed"
 
+        Console.WriteLine(sprintf "FUNDER - HHH")
+
         let channelInfoAfterPayment0 = walletInstance.ChannelStore.ChannelInfo channelId
         match channelInfo.Status with
         | ChannelStatus.Active -> ()
@@ -1335,6 +1440,8 @@ type LN() =
                 transferAmount
         UnwrapResult sendMonoHopPayment1Res "SendMonoHopPayment failed"
 
+        Console.WriteLine(sprintf "FUNDER - JJJ")
+
         let channelInfoAfterPayment1 = walletInstance.ChannelStore.ChannelInfo channelId
         match channelInfo.Status with
         | ChannelStatus.Active -> ()
@@ -1346,13 +1453,20 @@ type LN() =
         //do! lnd.FloodTransactionsToSetFeeRate bitcoind feeRate
 
         //ElectrumServer.SetEstimatedFeeRate (FeeRatePerKw (feeRate.Value * 4u))
+        Console.WriteLine(sprintf "FUNDER - KKK")
         bitcoind.SetFeeRateByMining (feeRate * 4u)
+        Console.WriteLine(sprintf "FUNDER - LLL")
+
+
         let! newFeeRateOpt = walletInstance.ChannelStore.FeeUpdateRequired channelId
+        Console.WriteLine(sprintf "FUNDER - ZZZ")
+
         let newFeeRate = UnwrapOption newFeeRateOpt "Fee update should be required"
         Console.WriteLine(sprintf "new fee is %A" newFeeRate)
         let! updateFeeRes =
             Lightning.Network.UpdateFee walletInstance.Node channelId newFeeRate
         UnwrapResult updateFeeRes "UpdateFee failed"
+        Console.WriteLine(sprintf "FUNDER - XXX")
 
         //ElectrumServer.SetEstimatedFeeRate (FeeRatePerKw (uint32 0))
 
@@ -1360,32 +1474,29 @@ type LN() =
         match closeChannelRes with
         | Ok _ -> ()
         | Error err -> failwith (SPrintF1 "error when closing channel: %s" err.Message)
+        Console.WriteLine(sprintf "FUNDER - CCC")
 
         match (walletInstance.ChannelStore.ChannelInfo channelId).Status with
         | ChannelStatus.Closing -> ()
         | status -> failwith (SPrintF1 "unexpected channel status. Expected Closing, got %A" status)
 
-        // Mine 10 blocks to make sure closing tx is confirmed
-        bitcoind.GenerateBlocksToSelf (BlockHeightOffset32 (uint32 10))
-        
-        let rec waitForClosingTxConfirmed attempt = async {
-            Infrastructure.LogDebug (SPrintF1 "Checking if closing tx is finished, attempt #%d" attempt)
-            if attempt = 10 then
-                return Error "Closing tx not confirmed after maximum attempts"
+        let rec waitForClosingTxConfirmed () = async {
+            let! txIsConfirmed = Lightning.Network.CheckClosingFinished (walletInstance.ChannelStore.ChannelInfo channelId)
+            if txIsConfirmed then
+                return Ok ()
             else
-                let! txIsConfirmed = Lightning.Network.CheckClosingFinished (walletInstance.ChannelStore.ChannelInfo channelId)
-                if txIsConfirmed then
-                    return Ok ()
-                else
-                    do! Async.Sleep 1000
-                    return! waitForClosingTxConfirmed (attempt + 1)
-                    
+                do! Async.Sleep 1000
+                return! waitForClosingTxConfirmed ()
         }
 
-        let! closingTxConfirmedRes = waitForClosingTxConfirmed 0
+        let! closingTxConfirmedRes = bitcoind.GenerateBlocksToCompletion <| waitForClosingTxConfirmed()
+
+        Console.WriteLine(sprintf "FUNDER - BBB")
+
         match closingTxConfirmedRes with
         | Ok _ -> ()
         | Error err -> failwith (SPrintF1 "error when waiting for closing tx to confirm: %s" err)
+        Console.WriteLine(sprintf "FUNDER - NNN")
 
         return ()
     }

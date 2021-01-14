@@ -279,29 +279,57 @@ type Bitcoind = {
         }
         let selfAddress = ret.GetNewAddress()
 
-        let initialBlocks = 10u
+        let confirmationsConsideredConfirmed = 6u
+        let initialBlocks = Bitcoind.LargeTxOutReserve + confirmationsConsideredConfirmed
         ret.GenerateBlocksRaw
             (BlockHeightOffset32 (initialBlocks + uint32 NBitcoin.Consensus.RegTest.CoinbaseMaturity))
             selfAddress
-        for i in 0 .. 20 do
-            let utxoCount = ret.ListUnspent().Length
-            Console.WriteLine(sprintf "UTXOS: doing initial split %i. Have %i utxos" i utxoCount)
-            ret.SplitUtxo()
-            ret.GenerateBlocksRaw
-                (BlockHeightOffset32 1u)
-                selfAddress
+        let rec split (i: uint32) (unspentCoins: list<Coin>): unit =
+            if i < confirmationsConsideredConfirmed then
+                let newUnspentCoins = ret.SplitUtxo defaultFeeRate unspentCoins
+                ret.GenerateBlocksRaw
+                    (BlockHeightOffset32 1u)
+                    selfAddress
+                split (i + 1u) newUnspentCoins
+        let unspentCoins = ret.ListUnspent None None false
+        split 0u unspentCoins
         ret.SetFeeRateByMining defaultFeeRate
         ret
 
-    member private this.SplitUtxo(): unit =
-        for _ in 1 .. 4 do
-            seq {
-                for _ in 1 .. 500 do
-                    yield (this.GetNewAddress(), Money(0.01m, MoneyUnit.BTC))
-            }
-            |> List.ofSeq
-            |> this.SendMany
-            |> ignore
+    static member LargeTxOutReserve: uint32 = 5u
+    static member SmallTxOutReserve: uint32 = 200u
+    static member BlockReward: Money = Money(50.0m, MoneyUnit.BTC)
+
+    member private this.SplitUtxo (feeRate: FeeRatePerKw) (unspentCoins: list<Coin>): list<Coin> =
+        Console.WriteLine(sprintf "calling SplitUtxo with %i coins" unspentCoins.Length)
+        let feeRate = FeeRatePerKw(uint32 <| 1.2 * float feeRate.Value)
+        let amount = Money((Bitcoind.BlockReward.ToUnit MoneyUnit.BTC) / (decimal (2u * Bitcoind.SmallTxOutReserve)), MoneyUnit.BTC)
+        let address = this.GetNewAddress()
+        let transaction = Network.RegTest.CreateTransaction()
+        for _ in 1u .. Bitcoind.SmallTxOutReserve do
+            let txOut = TxOut(amount, address)
+            transaction.Outputs.Add txOut |> ignore
+        let output = (int Bitcoind.SmallTxOutReserve) * amount
+
+        let rec addCoins (input: Money) (unspentCoins: list<Coin>): Money * list<Coin> =
+            let fee = feeRate.CalculateFeeFromVirtualSize(uint64 <| transaction.GetVirtualSize())
+            if input < output + fee then
+                let coin = unspentCoins.Head
+                let txIn = TxIn coin.Outpoint
+                transaction.Inputs.Add txIn |> ignore
+                addCoins (input + coin.Amount) unspentCoins.Tail
+            else
+                (input, unspentCoins)
+        let input, remainingCoins = addCoins Money.Zero unspentCoins
+        let fee = feeRate.CalculateFeeFromVirtualSize(uint64 <| transaction.GetVirtualSize())
+        let changeAmount = input - (output + fee)
+        let changeTxOut = TxOut(changeAmount, address)
+        transaction.Outputs.Add changeTxOut |> ignore
+        Console.WriteLine(sprintf "transaction == %A" transaction)
+        let signedTransaction = this.SignRawTransactionWithWallet transaction
+        let txIdOpt = this.TrySendRawTransaction signedTransaction
+        let _txId = UnwrapOption txIdOpt "failed to send utxo-splitting tx"
+        remainingCoins
 
     member this.GetMempoolInfo (): MempoolInfo =
         use bitcoinCli =
@@ -469,15 +497,19 @@ type Bitcoind = {
             match maxConfirmationsOpt with
             | Some maxConfirmations -> maxConfirmations.Value
             | None -> 9999999u
+        let includeUnsafeJson = if includeUnsafe then "true" else "false"
         use bitcoinCli =
             ProcessWrapper.New
                 "bitcoin-cli"
                 this.WorkDir
-                (SPrintF1 "-regtest -datadir=%s listunspent %i %i [] %A" this.DataDir minConfirmations maxConfirmations includeUnsafe)
+                (SPrintF4 "-regtest -datadir=%s listunspent %i %i [] %A" this.DataDir minConfirmations maxConfirmations includeUnsafeJson)
                 Map.empty
                 false
         let lines = bitcoinCli.ReadToEnd()
         let output = String.concat "\n" lines
+        let smeg = (SPrintF4 "-regtest -datadir=%s listunspent %i %i [] %A" this.DataDir minConfirmations maxConfirmations includeUnsafeJson)
+        Console.WriteLine(sprintf "sent input: %s" smeg)
+        Console.WriteLine(sprintf "got output: %s" output)
         let unspentList = JsonConvert.DeserializeObject<list<UnspentResponse>> output
         //Console.WriteLine(sprintf "UNSPENT = %A" unspentList)
         List.map
@@ -533,6 +565,7 @@ type Bitcoind = {
                 TxOut(amount, scriptPubKey)
             transaction.Outputs.Add txOut |> ignore
             let changeAmounts =
+                (*
                 if remainingUnspent.Length < 100 then
                     let changeAmount = (total - (amount + attemptedFee)) / 2L
                     let changeTxOut0 =
@@ -545,12 +578,13 @@ type Bitcoind = {
                     transaction.Outputs.Add changeTxOut1 |> ignore
                     [changeAmount; changeAmount]
                 else
-                    let changeAmount = total - (amount + attemptedFee)
-                    let changeTxOut =
-                        let changeAddress = this.GetNewAddress()
-                        TxOut(changeAmount, changeAddress)
-                    transaction.Outputs.Add changeTxOut |> ignore
-                    [changeAmount]
+                *)
+                let changeAmount = total - (amount + attemptedFee)
+                let changeTxOut =
+                    let changeAddress = this.GetNewAddress()
+                    TxOut(changeAmount, changeAddress)
+                transaction.Outputs.Add changeTxOut |> ignore
+                [changeAmount]
             let signedTransaction = this.SignRawTransactionWithWallet transaction
             let actualWeight = (int64 <| signedTransaction.GetVirtualSize()) * 4L
             let totalOut =
@@ -647,12 +681,16 @@ type Bitcoind = {
             Some <| List.append remainingUnspent newCoins
         
     member this.FillCurrentBlock (feeRate: FeeRatePerKw): unit = 
-        let utxoCount = this.ListUnspent().Length
-        Console.WriteLine(sprintf "UTXOS: filling block starting with %i utxos" utxoCount)
-        if utxoCount < 4000 then
-            this.SplitUtxo()
-            let blahUtxoCount = this.ListUnspent().Length
-            Console.WriteLine(sprintf "UTXOS: after splitting, have %i utxos" blahUtxoCount)
+        let unspentCoins = this.ListUnspent None None false
+        Console.WriteLine(sprintf "UTXOS: filling block starting with %i utxos" unspentCoins.Length)
+
+        let _unspentCoins =
+            if uint32 unspentCoins.Length < Bitcoind.SmallTxOutReserve then
+                let newUnspentCoins = this.SplitUtxo feeRate unspentCoins
+                Console.WriteLine(sprintf "UTXOS: after splitting, have %i utxos" newUnspentCoins.Length)
+                newUnspentCoins
+            else
+                unspentCoins
 
         let erfinv (x: double): double =
             let sgn = if x < 0.0 then -1.0 else 1.0
@@ -662,6 +700,7 @@ type Bitcoind = {
             let tt2 = 6.80272108843537414966 * lnthing
             sgn * Math.Sqrt(-tt1 + Math.Sqrt(tt1 * tt1 - tt2))
 
+        (*
         let maxFatTxWeight = 40000u
         let maxMempoolWeight = 4000000u
         let mempoolBurnTxWeight = maxMempoolWeight / 100u
@@ -683,31 +722,27 @@ type Bitcoind = {
                 fillBlockWithBurnTxs()
 
         //let rec fillBlockWithFatTxs (unspentCoins: list<Coin>): unit =
-        let rec fillBlockWithFatTxs (): unit =
+        let rec fillBlockWithFatTxs (unspentCoins: list<Coin>): unit =
             Console.WriteLine(sprintf "getting mempool info")
             let mempoolInfo = this.GetMempoolInfo()
             Console.WriteLine(sprintf "mempoolinfo == %A" mempoolInfo)
             let mempoolWeight = mempoolInfo.TotalWeight
             if mempoolWeight < mempoolFatTxWeight then
                 let weight = min maxFatTxWeight (mempoolFatTxWeight - mempoolWeight)
-                //Console.WriteLine(sprintf "FOO - %i unspent coins, mempoolWeight == %i, weight == %i" unspentCoins.Length mempoolWeight weight)
-                let unspentCoins = this.ListUnspent()
-                Console.WriteLine(sprintf "UTXOS: sending fat tx with %i utxos" unspentCoins.Length)
                 let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) weight feeRate
                 match newUnspentCoinsOpt with
-                | Some _newUnspentCoins ->
-                    //fillBlockWithFatTxs newUnspentCoins
-                    fillBlockWithFatTxs()
+                | Some newUnspentCoins ->
+                    Console.WriteLine(sprintf "UTXOS: after sending fat tx have %i utxos" newUnspentCoins.Length)
+                    fillBlockWithFatTxs newUnspentCoins
                 | None -> failwith "failed to send fat tx"
 
         fillBlockWithBurnTxs()
-        let afterBurnUtxoCount = this.ListUnspent().Length
-        Console.WriteLine(sprintf "UTXOS: after burning, have %i utxos" afterBurnUtxoCount)
-        //fillBlockWithFatTxs unspentCoins
-        fillBlockWithFatTxs ()
-        let afterFatUtxoCount = this.ListUnspent().Length
+        let unspentCoins = this.ListUnspent None None false
+        Console.WriteLine(sprintf "UTXOS: after burning, have %i utxos" unspentCoins.Length)
+        fillBlockWithFatTxs unspentCoins
+        let afterFatUtxoCount = (this.ListUnspent None None false).Length
         Console.WriteLine(sprintf "UTXOS: after fattening, have %i utxos" afterFatUtxoCount)
-        (*
+        *)
         let maxFatTxWeight = 40000u
         let maxMempoolWeight = 4000000u
         let mempoolBurnTxWeight = maxMempoolWeight / 100u
@@ -716,10 +751,7 @@ type Bitcoind = {
             let key = new Key()
             let pubKey = key.PubKey
             pubKey.GetAddress(ScriptPubKeyType.Segwit, Network.RegTest)
-        let rec fillBlockWithBurnTxs (prevMempoolWeight: uint32) (targetMempoolWeight: uint32): unit =
-            Console.WriteLine(sprintf "prevMempoolWeight == %A" prevMempoolWeight)
-            let mempoolWeight = this.GetMempoolInfo().TotalWeight
-            assert (prevMempoolWeight < mempoolWeight)
+        let rec fillBlockWithBurnTxs (mempoolWeight: uint32) (targetMempoolWeight: uint32): unit =
             if mempoolWeight < targetMempoolWeight then
                 let adjustedFeeRate = 
                     //let adjustment = 0.9 + 0.2 * (new Random()).NextDouble()
@@ -727,20 +759,17 @@ type Bitcoind = {
                     FeeRatePerKw <| uint32 ((double feeRate.Value) * adjustment)
                 this.SetFeeRateForBitcoindTransactions adjustedFeeRate
                 let _txId = this.SendToAddress burnAddress (Money(0.0001m, MoneyUnit.BTC))
-                fillBlockWithBurnTxs mempoolWeight targetMempoolWeight
+                let newMempoolWeight = this.GetMempoolInfo().TotalWeight
+                fillBlockWithBurnTxs newMempoolWeight targetMempoolWeight
 
-        let rec fillBlockWithFatTxs (unspentCoins: list<Coin>) (targetMempoolWeight: uint32) =
-            Console.WriteLine(sprintf "getting mempool info")
-            let mempoolInfo = this.GetMempoolInfo()
-            Console.WriteLine(sprintf "mempoolinfo == %A" mempoolInfo)
-            let mempoolWeight = mempoolInfo.TotalWeight
+        let rec fillBlockWithFatTxs (mempoolWeight: uint32) (targetMempoolWeight: uint32) (unspentCoins: list<Coin>): unit =
             if mempoolWeight < targetMempoolWeight then
                 let weight = min maxFatTxWeight (targetMempoolWeight - mempoolWeight)
-                //Console.WriteLine(sprintf "FOO - %i unspent coins, mempoolWeight == %i, weight == %i" unspentCoins.Length mempoolWeight weight)
                 let newUnspentCoinsOpt = this.TrySendFatTx unspentCoins (Money(0.01m, MoneyUnit.BTC)) weight feeRate
                 match newUnspentCoinsOpt with
                 | Some newUnspentCoins ->
-                    fillBlockWithFatTxs newUnspentCoins targetMempoolWeight
+                    let newMempoolWeight = this.GetMempoolInfo().TotalWeight
+                    fillBlockWithFatTxs newMempoolWeight targetMempoolWeight newUnspentCoins
                 | None -> failwith "failed to send fat tx"
 
         let initialMempoolWeight = this.GetMempoolInfo().TotalWeight
@@ -748,9 +777,8 @@ type Bitcoind = {
         fillBlockWithBurnTxs initialMempoolWeight (initialMempoolWeight + mempoolBurnTxWeight)
 
         Console.WriteLine(sprintf "listing unspent coins")
-        let unspentCoins = this.ListUnspent()
-        fillBlockWithFatTxs unspentCoins (initialMempoolWeight + maxMempoolWeight)
-        *)
+        let unspentCoins = this.ListUnspent None None false
+        fillBlockWithFatTxs (initialMempoolWeight + mempoolBurnTxWeight) (initialMempoolWeight + maxMempoolWeight) unspentCoins
 
     member this.GenerateBlocksRaw (number: BlockHeightOffset32) (address: BitcoinAddress) =
         use bitcoinCli =
